@@ -24,6 +24,11 @@ Before every commit, run the same three checks as CI: `ruff check`, `ruff format
 
 ## Rules
 
+- **Stay inside the project.** The main agent and every subagent work only inside this
+  repository (including its `.claude/worktrees/`). Do not read, create or change files
+  elsewhere on the machine; put scratch files in a git-ignored folder inside the repository.
+  Make no network calls unless the owner asks for one (for example `take2 fetch-airspace`).
+
 - **Tests first** for any calculation (altimetry, geometry, analysis): write the tests from the
   SPEC.md reference values, watch them fail, then implement.
 - **Never change a reference value** from SPEC.md to make a test pass. Report the discrepancy.

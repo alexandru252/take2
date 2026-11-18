@@ -231,3 +231,4 @@ __marimo__/
 
 # Claude Code agent worktrees (temporary copies of the repository)
 /.claude/worktrees/
+/.claude/scratch/
