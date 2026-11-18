@@ -203,7 +203,10 @@ def parse_gpx(text: str, cruise_alt_ft: float) -> Route:
 
 
 def parse_pln(text: str, cruise_alt_ft: float) -> Route:
-    """Parse an MSFS flight plan: one waypoint per ``ATCWaypoint`` element."""
+    """Parse an MSFS flight plan: one waypoint per ``ATCWaypoint`` element.
+
+    An altitude of 0 (``+000000.00``) means "not set", so the cruise altitude is used.
+    """
     _check_size(text)
     root = _parse_xml(text, "PLN")
 
@@ -219,7 +222,8 @@ def parse_pln(text: str, cruise_alt_ft: float) -> Route:
             lat, lon, alt_ft = parse_world_position(position)
         except RouteImportError as exc:
             raise RouteImportError(f"ATCWaypoint {index}: {exc}") from exc
-        raw.append((element.get("id"), lat, lon, alt_ft))
+        # Flight planners write +000000.00 when a waypoint has no altitude: treat 0 as not set.
+        raw.append((element.get("id"), lat, lon, alt_ft or None))
     return _build_route(raw, cruise_alt_ft)
 
 

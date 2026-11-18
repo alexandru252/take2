@@ -31,8 +31,8 @@ questions that are not decided yet.
   example the departure airport of an MSFS `.pln`), the first leg is analysed at that
   elevation, not at the altitude you intend to climb to. How Take2 should treat this is still
   open.
-- **MSFS `.pln` altitude 0.** `+000000.00` is read as 0 ft, not as "no altitude". It is not
-  certain whether flight planners write 0 for waypoints without an altitude.
+- **MSFS `.pln` altitude 0.** `+000000.00` is read as "no altitude", so the waypoint gets the
+  cruise altitude. A waypoint really planned at 0 ft (sea level) cannot be expressed in `.pln`.
 - **GPX with several routes.** The points of all routes are joined in file order.
 - **GPX contents read.** Only route points (`rte/rtept`) or, without a route, track points
   (`trk/trkseg/trkpt`) of GPX 1.0 or 1.1 are read. Standalone waypoints (`wpt`) are ignored.

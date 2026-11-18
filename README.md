@@ -17,7 +17,8 @@ Take2 reads routes from:
 
 - **GPX** 1.0 or 1.1: route points if the file has a route, otherwise track points.
   Elevations (metres) are converted to feet.
-- **MSFS `.pln`**: the `ATCWaypoint` elements of the flight plan.
+- **MSFS `.pln`**: the `ATCWaypoint` elements of the flight plan. An altitude of
+  `+000000.00` means "not set".
 - **CSV**: header `name,lat,lon,alt_ft`, decimal degrees, altitude in feet AMSL.
   `alt_ft` may be left empty.
 

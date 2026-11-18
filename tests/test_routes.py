@@ -292,20 +292,25 @@ def test_csv_columns_are_matched_by_header_name() -> None:
             ),
             id="gpx",
         ),
-        pytest.param(
-            parse_pln,
-            pln_document(
-                "N44° 30' 0.00\",E26° 0' 0.00\",+000000.00",
-                "N44° 36' 0.00\",E26° 6' 0.00\",+000000.00",
-            ),
-            id="pln",
-        ),
     ],
 )
 def test_zero_altitude_is_kept_not_replaced_by_cruise(parser, text: str) -> None:
     route = parser(text, cruise_alt_ft=CRUISE_FT)
 
     assert [w.alt_ft for w in route.waypoints] == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("altitude", ["+000000.00", "-000000.00", "+0"])
+def test_pln_altitude_of_zero_means_not_set(altitude: str) -> None:
+    # Flight planners write +000000.00 for waypoints without an altitude (owner's decision),
+    # so it falls back to the cruise altitude like a missing altitude does.
+    text = pln_document(
+        f"N44° 30' 0.00\",E26° 0' 0.00\",{altitude}", "N44° 36' 0.00\",E26° 6' 0.00\",+002500.00"
+    )
+
+    route = parse_pln(text, cruise_alt_ft=CRUISE_FT)
+
+    assert [w.alt_ft for w in route.waypoints] == [CRUISE_FT, 2500.0]
 
 
 def test_gpx_with_empty_route_falls_back_to_track_points() -> None:
