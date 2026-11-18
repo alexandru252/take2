@@ -228,3 +228,6 @@ __marimo__/
 # Take2: any local environment file with secrets; only the example is committed
 .env.*
 !.env.example
+
+# Claude Code agent worktrees (temporary copies of the repository)
+/.claude/worktrees/
