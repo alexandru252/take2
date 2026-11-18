@@ -16,6 +16,9 @@ dependencies = [
     "typer>=0.12",
 ]
 
+[project.scripts]
+take2 = "take2.cli:app"
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.100",
