@@ -27,6 +27,27 @@ waypoints. Route files are limited to 10 MB, 50,000 waypoints and 1,000 NM.
 
 See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for what Take2 does not model yet.
 
+## Airspace data (openAIP)
+
+Take2 uses airspace data from [openAIP](https://www.openaip.net), which needs a free openAIP
+account and its API key.
+
+1. Copy `.env.example` to `.env` and put your key after `OPENAIP_API_KEY=`. You can also set
+   the `OPENAIP_API_KEY` environment variable, which is used instead of `.env`. `.env` is
+   git-ignored: never commit a key.
+2. Download the airspaces of Romania:
+
+   ```sh
+   uv run take2 fetch-airspace --country RO
+   ```
+
+   This saves `data/ro.json` (also git-ignored); `--output PATH` saves elsewhere. The command
+   prints how many airspaces it saved and lists the ones Take2 cannot use (for example a
+   geometry other than a polygon). Run it again to refresh the data.
+
+openAIP data is maintained by its community and is not the official AIP; see
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+
 ## Development
 
 Requirements: [uv](https://docs.astral.sh/uv/). uv installs Python 3.12 automatically.

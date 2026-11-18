@@ -50,9 +50,46 @@ questions that are not decided yet.
   An edge meant to follow a parallel of latitude or a border over a long distance is only as
   accurate as the vertices that describe it.
 
+## openAIP airspace data
+
+- **Not the official AIP.** openAIP data is maintained by its community and can be
+  incomplete, outdated or wrong. Download it again before a planning session.
+- **Always active.** Take2 does not read activation times, hours of operation, NOTAM
+  activation or "on request"/"on demand" flags (`hoursOfOperation`, `activeFrom`,
+  `activeUntil`, `byNotam`, `onRequest`, `onDemand`). A TRA, TSA or danger area is treated as
+  active all the time.
+- **Fields not read:** `upperLimitMax`, `lowerLimitMin`, `activity`, `frequencies`,
+  `transponderSettings`, `remarks` and `country`.
+- **Only single-ring polygons.** openAIP describes an airspace as a GeoJSON `Polygon` with
+  one ring. An item with another geometry type, or with a hole, is skipped. An open ring is
+  closed by repeating its first position. Whether a polygon crosses itself is not checked.
+- **Unknown type codes are kept** as `TYPE_<n>` (for example `TYPE_37`). Such an airspace is
+  loaded, but no rule in the severity configuration matches it.
+- **Class 8 means unclassified.** openAIP code 8 ("Unclassified / Special Use Airspace")
+  becomes "no ICAO class", so only the airspace type decides whether a clearance is needed.
+- **Skipped items.** An item is skipped, counted and reported (the first 20 are described)
+  instead of failing the whole file when:
+  - it is not a JSON object, or `_id` or `name` is missing or not a non-empty string;
+  - `type` or `icaoClass` is missing or not a whole number of at least 0 (`true`/`false`
+    do not count), `type` is 1000 or more, or `icaoClass` is not 0 to 6 or 8;
+  - `lowerLimit` or `upperLimit` is missing, its `value` is not a finite number, its `unit`
+    is not 0 (metres), 1 (feet) or 6 (flight level), or its `referenceDatum` is not
+    0 (GND), 1 (MSL) or 2 (STD);
+  - the geometry is not a single-ring `Polygon`, a position is not exactly `[lon, lat]`,
+    a coordinate is out of range, or the closed ring has fewer than 4 positions;
+  - its `_id` was already seen earlier in the file.
+- **Strict JSON.** A file or API page with `NaN`, `Infinity`, a number too large for a
+  float, or nesting deeper than Python's JSON parser allows is rejected as a whole.
+- **Open question: unlimited upper limits.** How openAIP writes "UNL" is not verified.
+  Take2 uses the value exactly as published.
+- **API behaviour seen on 2026-11-18:** the airspaces endpoint answers HTTP 403 without a
+  key and HTTP 404 ("Failed to load user permissions") for a key it does not know, so Take2
+  treats a 404 as a probable key problem. A redirect is never followed, so the key is never
+  sent to another host.
+
 ## Input limits
 
-These keep the work bounded when a route file comes from someone else.
+These keep the work bounded when a route file or airspace data comes from someone else.
 
 XML is checked with the expat library bundled with Python; version 2.7.2 or later is
 required (a test checks this).
@@ -71,3 +108,11 @@ required (a test checks this).
 | DOCTYPE / DTD in GPX or `.pln` | not allowed |
 | Route length | 1,000 NM |
 | Route samples | 100,000 |
+| openAIP file size (`load_openaip_file`) | 100 MB |
+| openAIP download: pages | 100 (1,000 items requested per page) |
+| openAIP download: one page | 50 MB; compressed responses are refused |
+| openAIP download: all pages together | 100 MB |
+| openAIP download: time for one page | 120 s |
+| openAIP request timeouts | 10 s to connect, 30 s per read or write |
+| `.env` file | 1 MB |
+| openAIP API key | 512 visible ASCII characters, no spaces |
