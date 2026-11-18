@@ -9,6 +9,7 @@ import itertools
 import json
 import logging
 import os
+import stat
 import threading
 import time
 import traceback
@@ -1005,7 +1006,7 @@ def test_load_rejects_a_huge_file_without_reading_all_of_it(
 
 # --- fetch_airspaces: the openAIP API through httpx.MockTransport -------------------
 
-FAKE_KEY = "fictional-test-key-0123456789abcdef"  # never a real key
+FAKE_KEY = "Zq8Wv3Lm7Tx2Rk9Pd4Hs6Jy1Nc5Bg0Fa"  # made up; shares no 6 characters with fixtures
 Handler = Callable[[httpx.Request], httpx.Response]
 
 
@@ -1056,9 +1057,24 @@ def raise_error(error: Exception) -> Handler:
     return handler
 
 
+def assert_no_key_fragment(text: str, key: str = FAKE_KEY) -> None:
+    """No 6-character piece of ``key`` appears in ``text`` (catches cut or partial echoes)."""
+    leaked = [key[i : i + 6] for i in range(len(key) - 5) if key[i : i + 6] in text]
+    assert not leaked, f"key fragments shown: {leaked[:3]}"
+
+
+def shown(exc: BaseException) -> str:
+    """Everything a user or a log could see of an exception."""
+    return str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+
+
 def assert_key_not_shown(exc: BaseException) -> None:
-    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
-    assert FAKE_KEY not in shown
+    assert_no_key_fragment(shown(exc))
+
+
+def test_the_fake_key_shares_no_fragment_with_the_fixture() -> None:
+    # Otherwise a fragment check could not tell a leak from fixture text.
+    assert_no_key_fragment(FIXTURE.read_text(encoding="utf-8"))
 
 
 def test_fetch_requests_pages_until_the_last_one_and_keeps_the_order() -> None:
@@ -1618,7 +1634,137 @@ def test_logging_during_a_fetch_never_shows_the_key(caplog: pytest.LogCaptureFix
     fetch_with(FakeOpenAip([make_item(_id="a")], [make_item(_id="b")]))
 
     assert caplog.records  # httpx logs each request, so the check below is not vacuous
-    assert FAKE_KEY not in caplog.text
+    assert_no_key_fragment(caplog.text)
+
+
+def endless_pages(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"items": [], "nextPage": int(request.url.params["page"]) + 1})
+
+
+# Every way a download can fail. Responses are built per request (a handler may be called
+# several times), and bodies are streamed so httpx.Response does not decode them up front.
+FAILURES: dict[str, Handler] = {
+    "401": lambda request: httpx.Response(401),
+    "403": lambda request: httpx.Response(403),
+    "404": lambda request: httpx.Response(404, json={"message": "Failed to load user"}),
+    "429": lambda request: httpx.Response(429),
+    "500 echoing the key": lambda request: httpx.Response(500, text=FAKE_KEY),
+    "302": lambda request: httpx.Response(302, headers={"location": "https://x.invalid/"}),
+    "declared too large": lambda request: httpx.Response(
+        200, headers={"content-length": str(10**9)}, content=iter([b"{}"])
+    ),
+    "streamed too large": lambda request: httpx.Response(200, content=iter([b" " * 6_000])),
+    "gzip": lambda request: httpx.Response(
+        200, headers={"content-encoding": "gzip"}, content=iter([gzip_bomb(10)])
+    ),
+    "bad JSON echoing the key": lambda request: httpx.Response(
+        200, content=b"oops " + FAKE_KEY.encode()
+    ),
+    "bad nextPage": lambda request: httpx.Response(200, json={"items": [], "nextPage": 7}),
+    "items are not objects": lambda request: httpx.Response(200, json={"items": [1]}),
+    "too many items": lambda request: httpx.Response(200, json={"items": [{}] * (PAGE_SIZE + 1)}),
+    "endless pages": endless_pages,
+    "connect error, key across the 80-character cut": raise_error(
+        httpx.ConnectError("x" * 60 + FAKE_KEY)
+    ),
+    "read timeout quoting the key": raise_error(httpx.ReadTimeout(f"slow {FAKE_KEY}")),
+}
+
+
+@pytest.mark.parametrize("handler", FAILURES.values(), ids=FAILURES.keys())
+def test_no_failure_shows_any_fragment_of_the_key(
+    handler: Handler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_PAGE_BYTES", 5_000)
+
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(handler)
+
+    assert_key_not_shown(excinfo.value)
+    assert excinfo.value.__context__ is None
+
+
+def test_a_slow_page_error_shows_no_fragment_of_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    ticks = itertools.count(start=0.0, step=100.0)
+    monkeypatch.setattr(openaip, "_clock", lambda: next(ticks))
+
+    with pytest.raises(OpenAipFetchError, match="too slowly") as excinfo:
+        fetch_with(respond(httpx.Response(200, content=iter([b" ", b" ", b" "]))))
+
+    assert_key_not_shown(excinfo.value)
+
+
+def test_a_too_long_key_is_not_echoed_even_in_part() -> None:
+    key = (FAKE_KEY * 20)[:513]
+
+    with pytest.raises(ValueError, match="longer than 512") as excinfo:
+        fetch_with(FakeOpenAip([]), api_key=key)
+
+    assert_no_key_fragment(shown(excinfo.value), key=key)
+
+
+# --- pagination edges, exact limits, exact messages --------------------------------
+
+
+@pytest.mark.parametrize("next_page", [2.0, 3], ids=["2.0", "skips to 3"])
+def test_a_bad_next_page_fails_on_the_page_that_sent_it(next_page: object) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        page = int(request.url.params["page"])
+        body: dict[str, object] = {"items": [make_item(_id=f"p{page}")]}
+        if page == 1:
+            body["nextPage"] = next_page
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(OpenAipFetchError, match="on page 1: unexpected nextPage"):
+        fetch_with(handler)
+
+    assert len(requests) == 1
+
+
+def test_a_declared_content_length_equal_to_the_page_limit_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_PAGE_BYTES", 5_000)
+    data = json.dumps({"items": [make_item()]}).encode()
+    data += b" " * (5_000 - len(data))
+    response = httpx.Response(200, headers={"content-length": "5000"}, content=iter([data]))
+
+    assert len(fetch_with(respond(response))) == 1
+
+
+def test_the_time_limit_applies_to_each_page_not_to_the_whole_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every clock reading is 0.4 x MAX_PAGE_SECONDS later: each page stays within its own
+    # limit, the three pages together do not.
+    ticks = itertools.count(start=0.0, step=MAX_PAGE_SECONDS * 0.4)
+    monkeypatch.setattr(openaip, "_clock", lambda: next(ticks))
+    server = FakeOpenAip([make_item(_id="a")], [make_item(_id="b")], [make_item(_id="c")])
+
+    assert len(fetch_with(server)) == 3
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (401, "openAIP rejected the API key (HTTP 401); check OPENAIP_API_KEY"),
+        (403, "openAIP rejected the API key (HTTP 403); check OPENAIP_API_KEY"),
+        (429, "openAIP request failed with HTTP 429 (too many requests; try again later)"),
+        (500, "openAIP request failed with HTTP 500 (openAIP server error; try again later)"),
+        (503, "openAIP request failed with HTTP 503 (openAIP server error; try again later)"),
+        (418, "openAIP request failed with HTTP 418"),
+        (204, "openAIP request failed with HTTP 204"),
+    ],
+)
+def test_status_messages(status: int, message: str) -> None:
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(respond(httpx.Response(status)))
+
+    assert str(excinfo.value) == message
+    assert excinfo.value.status_code == status
 
 
 # --- save_openaip_file ------------------------------------------------------------
@@ -1650,6 +1796,59 @@ def test_a_saved_file_carries_the_attribution_country_and_raw_items(tmp_path: Pa
     fetched_at = datetime.fromisoformat(document["fetchedAt"])
     assert fetched_at.utcoffset() == timedelta(0)
     assert abs(datetime.now(UTC) - fetched_at) < timedelta(minutes=5)
+
+
+@pytest.mark.parametrize(
+    ("slack", "saved"), [(0, True), (-1, False)], ids=["exact", "one byte less"]
+)
+def test_save_accepts_data_of_exactly_the_file_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slack: int, saved: bool
+) -> None:
+    probe = tmp_path / "probe.json"
+    save_openaip_file(probe, [make_item()], country="RO")
+    size = probe.stat().st_size  # fetchedAt has a fixed width, so the size is stable
+    monkeypatch.setattr(openaip, "MAX_OPENAIP_FILE_SIZE", size + slack)
+    path = tmp_path / "ro.json"
+
+    if saved:
+        save_openaip_file(path, [make_item()], country="RO")
+        assert len(load_openaip_file(path).airspaces) == 1
+    else:
+        with pytest.raises(OpenAipFileError, match="could not be read back"):
+            save_openaip_file(path, [make_item()], country="RO")
+        assert not path.exists()
+
+
+@pytest.fixture
+def far_from_utc(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Local time 14 hours ahead of UTC all year, so a local timestamp would be caught."""
+    monkeypatch.setenv("TZ", "Pacific/Kiritimati")
+    time.tzset()
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+@pytest.mark.usefixtures("far_from_utc")
+def test_fetched_at_is_utc_whatever_the_local_time_zone(tmp_path: Path) -> None:
+    assert time.localtime().tm_gmtoff == 14 * 3600  # the fixture really moved the clock
+    path = tmp_path / "ro.json"
+
+    save_openaip_file(path, [make_item()], country="RO")
+
+    fetched_at = datetime.fromisoformat(json.loads(path.read_bytes())["fetchedAt"])
+    assert fetched_at.utcoffset() == timedelta(0)
+    assert abs(datetime.now(UTC) - fetched_at) < timedelta(minutes=5)
+
+
+def test_a_saved_file_is_private_to_its_owner(tmp_path: Path) -> None:
+    path = tmp_path / "ro.json"
+
+    save_openaip_file(path, [make_item()], country="RO")
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # documented in docs/LIMITATIONS.md
 
 
 def test_a_lone_surrogate_in_the_raw_items_is_saved_and_loads_back(tmp_path: Path) -> None:
@@ -1959,14 +2158,14 @@ def test_env_file_with_a_utf8_bom(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("no_key_in_environment")
-@pytest.mark.parametrize("text", ['OPENAIP_API_KEY="abc123\n', "OPENAIP_API_KEY='abc123\n"])
-def test_an_unclosed_quote_is_an_error_that_does_not_echo_the_value(
-    tmp_path: Path, text: str
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_an_unclosed_quote_is_an_error_that_does_not_echo_any_part_of_the_value(
+    tmp_path: Path, quote: str
 ) -> None:
     with pytest.raises(ValueError, match="closing quote") as excinfo:
-        read_api_key(env_file(tmp_path, text))
+        read_api_key(env_file(tmp_path, f"OPENAIP_API_KEY={quote}{FAKE_KEY}\n"))
 
-    assert "abc123" not in str(excinfo.value)
+    assert_no_key_fragment(shown(excinfo.value))
 
 
 @pytest.mark.usefixtures("no_key_in_environment")

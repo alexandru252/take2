@@ -17,10 +17,15 @@ from typer.testing import CliRunner
 
 from take2 import cli
 from take2.io import openaip
-from take2.io.openaip import ATTRIBUTION, OpenAipFetchError, load_openaip_file
+from take2.io.openaip import (
+    ATTRIBUTION,
+    OpenAipFetchError,
+    load_openaip_file,
+    parse_openaip_airspaces,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "openaip_airspaces.json"
-FAKE_KEY = "fictional-cli-key-9876543210"  # never a real key
+FAKE_KEY = "Zq8Wv3Lm7Tx2Rk9Pd4Hs6Jy1Nc5Bg0Fa"  # made up; shares no 6 characters with fixtures
 runner = CliRunner()
 
 type FetchCalls = list[tuple[str, str]]
@@ -410,4 +415,77 @@ def test_an_unreadable_dot_env_exits_1_without_echoing_it(
     result = run("fetch-airspace", "--country", "RO")
 
     assert_clean_failure(result, expected="no closing quote")
+    assert_no_key_fragment(result.output)
     assert fake_fetch == []
+
+
+# --- the real fetch_airspaces over a mock transport -------------------------------
+
+
+def assert_no_key_fragment(text: str) -> None:
+    """No 6-character piece of the key appears in ``text``."""
+    leaked = [FAKE_KEY[i : i + 6] for i in range(len(FAKE_KEY) - 5) if FAKE_KEY[i : i + 6] in text]
+    assert not leaked, f"key fragments shown: {leaked[:3]}"
+
+
+def paged(
+    items: list[dict[str, object]], per_page: int
+) -> Callable[[httpx.Request], httpx.Response]:
+    """A handler serving ``items`` like the openAIP API, ``per_page`` items per page."""
+    pages = [items[i : i + per_page] for i in range(0, len(items), per_page)] or [[]]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        body: dict[str, object] = {"page": page, "items": pages[page - 1]}
+        if page < len(pages):
+            body["nextPage"] = page + 1
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+def refuse(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError(f"connection refused for {FAKE_KEY}")
+
+
+REAL_FETCH_CASES = {
+    "success over three pages": (paged(fixture_items(), 2), 0),
+    "401": (lambda request: httpx.Response(401), 1),
+    "404": (lambda request: httpx.Response(404), 1),
+    "connect error quoting the key": (refuse, 1),
+}
+
+
+@pytest.mark.usefixtures("with_key")
+@pytest.mark.parametrize(
+    ("handler", "exit_code"), REAL_FETCH_CASES.values(), ids=REAL_FETCH_CASES.keys()
+)
+def test_the_key_is_never_shown_or_saved(
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+    exit_code: int,
+) -> None:
+    serve(monkeypatch, handler)
+
+    result = run("fetch-airspace", "--country", "RO")
+
+    assert result.exit_code == exit_code, result.output
+    assert_no_key_fragment(result.output)  # stdout and stderr together
+    written = [path for path in workdir.rglob("*") if path.is_file()]
+    assert len(written) == (1 if exit_code == 0 else 0)
+    for path in written:
+        assert_no_key_fragment(path.read_bytes().decode("utf-8", "replace"))
+
+
+@pytest.mark.usefixtures("with_key")
+def test_download_save_and_load_give_the_same_airspaces_as_the_items(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    serve(monkeypatch, paged(fixture_items(), 3))
+
+    result = run("fetch-airspace", "--country", "RO")
+
+    assert result.exit_code == 0, result.output
+    loaded = load_openaip_file(workdir / "data" / "ro.json")
+    assert loaded == parse_openaip_airspaces(fixture_items())
