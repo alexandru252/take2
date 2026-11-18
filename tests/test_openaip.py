@@ -1342,6 +1342,18 @@ def test_items_that_are_not_standard_json_are_not_saved(tmp_path: Path, items: l
     assert not path.exists()
 
 
+def test_items_nested_too_deeply_are_not_saved(tmp_path: Path) -> None:
+    nested: list[object] = []
+    for _ in range(100_000):
+        nested = [nested]
+    path = tmp_path / "ro.json"
+
+    with pytest.raises(OpenAipFileError, match="cannot be written as JSON"):
+        save_openaip_file(path, [{"geometry": nested}], country="RO")
+
+    assert not path.exists()
+
+
 def test_data_too_large_to_read_back_is_not_saved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

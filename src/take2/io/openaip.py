@@ -219,8 +219,9 @@ def save_openaip_file(path: str | Path, items: list[dict[str, object]], *, count
     }
     try:
         text = json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise OpenAipFileError(f"the airspace items cannot be written as JSON: {exc}") from None
+    except (TypeError, ValueError, RecursionError) as exc:
+        reason = _preview(str(exc), 80)
+        raise OpenAipFileError(f"the airspace items cannot be written as JSON: {reason}") from None
     data = text.encode("utf-8") + b"\n"
     if len(data) > MAX_OPENAIP_FILE_SIZE:
         raise OpenAipFileError(
