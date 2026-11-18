@@ -1,5 +1,7 @@
 """Tests for take2.altimetry, using the reference values from SPEC.md section 7.1."""
 
+import math
+
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -44,8 +46,8 @@ def test_pressure_altitude_of_standard_pressure_is_exactly_zero() -> None:
     assert pressure_altitude_of_level_ft(1013.25) == 0.0
 
 
-@pytest.mark.parametrize("p_hpa", [0.0, -1.0, -1013.25])
-def test_pressure_altitude_rejects_non_positive_pressure(p_hpa: float) -> None:
+@pytest.mark.parametrize("p_hpa", [0.0, -1.0, -1013.25, math.inf, math.nan])
+def test_pressure_altitude_rejects_invalid_pressure(p_hpa: float) -> None:
     with pytest.raises(ValueError, match="positive"):
         pressure_altitude_of_level_ft(p_hpa)
 

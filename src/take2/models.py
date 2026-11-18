@@ -4,9 +4,16 @@ Units are explicit in field names wherever a field carries a physical quantity.
 """
 
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Upper bound on route size, so a small crafted file cannot exhaust memory downstream.
+# 50,000 points is about 14 hours of a 1 Hz GPS track.
+MAX_ROUTE_WAYPOINTS = 50_000
+
+Latitude = Annotated[float, Field(ge=-90.0, le=90.0, allow_inf_nan=False)]
+Longitude = Annotated[float, Field(ge=-180.0, le=180.0, allow_inf_nan=False)]
 
 
 class LimitReference(StrEnum):
@@ -19,6 +26,8 @@ class LimitReference(StrEnum):
 
 class VerticalLimit(BaseModel):
     """A vertical airspace limit exactly as published."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     value: float  # number as published (feet, metres or FL number)
     unit: Literal["FT", "M", "FL"]
@@ -34,7 +43,7 @@ class Airspace(BaseModel):
     icao_class: str | None = Field(pattern=r"^[A-G]$")  # "A".."G" or None
     lower: VerticalLimit
     upper: VerticalLimit
-    polygon_lonlat: list[tuple[float, float]]  # WGS84 (lon, lat), closed ring
+    polygon_lonlat: list[tuple[Longitude, Latitude]]  # WGS84 (lon, lat), closed ring
     fictional: bool = False
 
     @field_validator("polygon_lonlat")
@@ -53,19 +62,21 @@ class Waypoint(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
 
     name: str
-    lat: float = Field(ge=-90.0, le=90.0)
-    lon: float = Field(ge=-180.0, le=180.0)
+    lat: Latitude
+    lon: Longitude
     alt_ft: float | None = None  # planned altitude AMSL on QNH
 
 
 class Route(BaseModel):
-    """An ordered list of at least two waypoints."""
+    """An ordered list of at least two (and at most MAX_ROUTE_WAYPOINTS) waypoints."""
 
-    waypoints: list[Waypoint] = Field(min_length=2)
+    waypoints: list[Waypoint] = Field(min_length=2, max_length=MAX_ROUTE_WAYPOINTS)
 
 
 class Event(BaseModel):
     """Something that happens along the route with respect to one airspace."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     airspace_id: str
     airspace_name: str

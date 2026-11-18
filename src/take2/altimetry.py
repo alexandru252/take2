@@ -4,6 +4,7 @@ Uses the ISA troposphere model with no temperature correction (out of scope for 
 All altitudes are in feet; "altitude on QNH" means what an altimeter set to QNH indicates.
 """
 
+import math
 from typing import assert_never
 
 from take2.models import LimitReference, VerticalLimit
@@ -23,8 +24,8 @@ def pressure_altitude_of_level_ft(p_hpa: float) -> float:
 
     Zero at 1013.25 hPa, negative for higher pressures.
     """
-    if not p_hpa > 0:
-        raise ValueError(f"pressure must be positive, got {p_hpa} hPa")
+    if not (math.isfinite(p_hpa) and p_hpa > 0):
+        raise ValueError(f"pressure must be a positive finite number, got {p_hpa} hPa")
     ratio = p_hpa / STANDARD_PRESSURE_HPA
     return _ISA_PRESSURE_ALTITUDE_SCALE_FT * (1 - ratio**_ISA_PRESSURE_ALTITUDE_EXPONENT)
 
