@@ -6,6 +6,7 @@ made-up string.
 """
 
 import json
+import re
 from collections.abc import Callable
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -27,6 +28,14 @@ from take2.io.openaip import (
 FIXTURE = Path(__file__).parent / "fixtures" / "openaip_airspaces.json"
 FAKE_KEY = "Zq8Wv3Lm7Tx2Rk9Pd4Hs6Jy1Nc5Bg0Fa"  # made up; shares no 6 characters with fixtures
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def plain(text: str) -> str:
+    """Remove ANSI styling: typer forces colours when GITHUB_ACTIONS is set (as on CI)."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
 
 type FetchCalls = list[tuple[str, str]]
 
@@ -89,15 +98,15 @@ def test_help_lists_fetch_airspace() -> None:
     result = run("--help")
 
     assert result.exit_code == 0
-    assert "fetch-airspace" in result.output
+    assert "fetch-airspace" in plain(result.output)
 
 
 def test_fetch_airspace_help_documents_its_options() -> None:
     result = run("fetch-airspace", "--help")
 
     assert result.exit_code == 0
-    assert "--country" in result.output
-    assert "--output" in result.output
+    assert "--country" in plain(result.output)
+    assert "--output" in plain(result.output)
 
 
 def test_tracebacks_never_show_local_variables() -> None:
@@ -308,7 +317,7 @@ def test_country_is_required(workdir: Path) -> None:
     result = run("fetch-airspace")
 
     assert result.exit_code == 2  # usage error
-    assert "--country" in result.output
+    assert "--country" in plain(result.output)
 
 
 @pytest.mark.usefixtures("with_key")
