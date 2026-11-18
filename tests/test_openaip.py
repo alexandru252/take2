@@ -896,6 +896,22 @@ def test_a_rejected_api_key_is_reported_with_the_status(status: int) -> None:
     assert_key_not_shown(excinfo.value)
 
 
+def test_a_404_points_at_the_api_key() -> None:
+    # Observed on the live API (2026-11-18): an unknown key gets HTTP 404 with
+    # {"message": "Failed to load user permissions. Not Found", "code": "app/not-found"};
+    # no key at all gets 403.
+    body = {"message": "Failed to load user permissions. Not Found", "code": "app/not-found"}
+
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(respond(httpx.Response(404, json=body)))
+
+    assert str(excinfo.value) == (
+        "openAIP request failed with HTTP 404 (openAIP answers 404 for an API key it does "
+        "not know; check OPENAIP_API_KEY)"
+    )
+    assert excinfo.value.status_code == 404
+
+
 @pytest.mark.parametrize("status", [404, 429, 500, 502, 503])
 def test_other_http_errors_are_reported_with_the_status(status: int) -> None:
     with pytest.raises(OpenAipFetchError, match=f"HTTP {status}") as excinfo:

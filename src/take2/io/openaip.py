@@ -568,7 +568,12 @@ def _check_status(status: int) -> None:
         return
     if status in (401, 403):
         raise OpenAipFetchError(f"openAIP rejected the API key (HTTP {status})", status)
-    hint = {429: "too many requests; try again later"}.get(status)
+    hint = {
+        # Observed on the live API: an unknown key gets 404 ("Failed to load user
+        # permissions"), not 401/403. The URL is fixed, so the key is the likely cause.
+        404: f"openAIP answers 404 for an API key it does not know; check {API_KEY_ENV_VAR}",
+        429: "too many requests; try again later",
+    }.get(status)
     if hint is None and status >= 500:
         hint = "openAIP server error; try again later"
     message = f"openAIP request failed with HTTP {status}"
