@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # Upper bound on route size, so a small crafted file cannot exhaust memory downstream.
 # 50,000 points is about 14 hours of a 1 Hz GPS track.
 MAX_ROUTE_WAYPOINTS = 50_000
+# Upper bound on airspace polygon size; real openAIP rings have at most a few thousand points,
+# and analysis cost grows with route samples times vertices.
+MAX_POLYGON_POSITIONS = 20_000
+
+_FT_PER_UNIT = {"FT": 1.0, "M": 3.28084, "FL": 100.0}
 
 Latitude = Annotated[float, Field(ge=-90.0, le=90.0, allow_inf_nan=False)]
 Longitude = Annotated[float, Field(ge=-180.0, le=180.0, allow_inf_nan=False)]
@@ -33,17 +38,29 @@ class VerticalLimit(BaseModel):
     unit: Literal["FT", "M", "FL"]
     reference: LimitReference
 
+    @model_validator(mode="after")
+    def _check_flight_level_reference(self) -> Self:
+        if self.unit == "FL" and self.reference is not LimitReference.STD:
+            raise ValueError("a flight level limit must use the STD reference")
+        return self
+
+    def value_ft(self) -> float:
+        """The published value in feet, in this limit's own reference."""
+        return self.value * _FT_PER_UNIT[self.unit]
+
 
 class Airspace(BaseModel):
     """An airspace volume: a WGS84 polygon between a lower and an upper limit."""
 
     id: str
-    name: str
+    name: str = Field(max_length=256)
     type: str  # CTR, TMA, CTA, ATZ, TMZ, RMZ, P, R, D, ...
     icao_class: str | None = Field(pattern=r"^[A-G]$")  # "A".."G" or None
     lower: VerticalLimit
     upper: VerticalLimit
-    polygon_lonlat: list[tuple[Longitude, Latitude]]  # WGS84 (lon, lat), closed ring
+    polygon_lonlat: list[tuple[Longitude, Latitude]] = Field(
+        max_length=MAX_POLYGON_POSITIONS
+    )  # WGS84 (lon, lat), closed ring
     fictional: bool = False
 
     @field_validator("polygon_lonlat")
@@ -54,6 +71,15 @@ class Airspace(BaseModel):
         if ring[0] != ring[-1]:
             raise ValueError("the polygon ring must be closed (first position == last)")
         return ring
+
+    @model_validator(mode="after")
+    def _check_limits_order(self) -> Self:
+        # Only comparable when both limits use the same reference; otherwise the order depends
+        # on QNH or terrain on the day.
+        same = self.lower.reference is self.upper.reference
+        if same and self.lower.value_ft() > self.upper.value_ft():
+            raise ValueError("the lower limit is above the upper limit")
+        return self
 
 
 class Waypoint(BaseModel):

@@ -156,7 +156,10 @@ def test_surface_limit_reaches_the_ground_exactly(ground_elev_ft: float) -> None
 
 @pytest.mark.parametrize("reference", [LimitReference.MSL, LimitReference.GND])
 def test_flight_level_unit_requires_std_reference(reference: LimitReference) -> None:
-    limit = VerticalLimit(value=65, unit="FL", reference=reference)
-
+    # The model rejects it (so bad data is caught at load time) ...
+    with pytest.raises(ValueError, match="STD"):
+        VerticalLimit(value=65, unit="FL", reference=reference)
+    # ... and the conversion still refuses one built without validation.
+    limit = VerticalLimit.model_construct(value=65.0, unit="FL", reference=reference)
     with pytest.raises(ValueError, match="STD"):
         limit_to_altitude_ft(limit, qnh_hpa=1013.25)

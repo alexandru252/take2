@@ -202,3 +202,58 @@ def test_vertical_limit_rejects_non_finite_value(value: float) -> None:
 
     error = excinfo.value.errors()[0]
     assert (error["loc"], error["type"]) == (("value",), "finite_number")
+
+
+# --- security review of milestone 6: data that cannot be analysed safely ------------
+
+
+def test_airspace_polygon_has_at_most_20_000_positions() -> None:
+    ring = [(25.9 + i * 1e-5, 44.4) for i in range(19_997)] + [(26.1, 44.6), (25.9, 44.6)]
+    ring.append(ring[0])
+    assert len(ring) == 20_000
+    assert len(make_airspace(polygon_lonlat=ring).polygon_lonlat) == 20_000
+
+    with pytest.raises(ValidationError) as excinfo:
+        make_airspace(polygon_lonlat=ring[:-1] + [(25.95, 44.65), ring[0]])
+    assert excinfo.value.errors()[0]["type"] == "too_long"
+
+
+@pytest.mark.parametrize(
+    ("lower", "upper"),
+    [
+        (
+            VerticalLimit(value=3500, unit="FT", reference=LimitReference.MSL),
+            VerticalLimit(value=1000, unit="FT", reference=LimitReference.MSL),
+        ),
+        (
+            VerticalLimit(value=95, unit="FL", reference=LimitReference.STD),
+            VerticalLimit(value=65, unit="FL", reference=LimitReference.STD),
+        ),
+        (
+            VerticalLimit(value=2000, unit="M", reference=LimitReference.MSL),
+            VerticalLimit(value=5000, unit="FT", reference=LimitReference.MSL),
+        ),
+    ],
+    ids=["ft-msl", "fl", "m-vs-ft"],
+)
+def test_airspace_with_lower_limit_above_upper_on_the_same_reference_is_rejected(
+    lower: VerticalLimit, upper: VerticalLimit
+) -> None:
+    # Such an airspace could never be entered, so it would hide itself from the analysis.
+    with pytest.raises(ValidationError, match="lower limit"):
+        make_airspace(lower=lower, upper=upper)
+
+
+def test_airspace_with_limits_on_different_references_is_accepted() -> None:
+    # SFC to FL65 or 3500 ft MSL to FL95: only comparable on the day, so not checked here.
+    space = make_airspace(
+        lower=VerticalLimit(value=4000, unit="FT", reference=LimitReference.MSL),
+        upper=VerticalLimit(value=35, unit="FL", reference=LimitReference.STD),
+    )
+    assert space.lower.value == 4000
+
+
+def test_airspace_name_is_limited_to_256_characters() -> None:
+    assert make_airspace(name="N" * 256).name == "N" * 256
+    with pytest.raises(ValidationError, match="name"):
+        make_airspace(name="N" * 257)
