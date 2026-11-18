@@ -22,6 +22,7 @@ import httpx
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from pydantic import ValidationError
 
 import take2
 from take2.io import openaip
@@ -315,6 +316,52 @@ def test_an_open_ring_of_three_positions_becomes_a_closed_triangle() -> None:
     airspace = only_airspace(make_item(geometry=polygon(ring)))
 
     assert airspace.polygon_lonlat == [(26.0, 44.4), (26.1, 44.4), (26.05, 44.5), (26.0, 44.4)]
+
+
+def test_an_out_of_range_ring_is_skipped_at_its_first_bad_position_without_building_it() -> None:
+    ring = [[999.0, 1.0]] * 20_000  # every position out of range
+    item = make_item(geometry=polygon(ring))
+
+    tracemalloc.start()
+    try:
+        result = parse_openaip_airspaces([item])
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.problems == [
+        "item 1 ('FICTIONAL TEST TMA') skipped: position 1 is out of range "
+        "(lon -180 to 180, lat -90 to 90)"
+    ]
+    # One validation error per vertex (what pydantic would build) costs megabytes here.
+    assert peak_bytes < 500_000
+
+
+@pytest.mark.parametrize("position", [[180.5, 44.0], [-180.5, 44.0], [26.0, 90.5], [26.0, -90.5]])
+def test_the_first_out_of_range_position_is_named(position: list[float]) -> None:
+    ring = [[26.0, 44.4], [26.1, 44.4], position, [26.0, 44.5], [26.0, 44.4]]
+
+    (problem,) = parse_openaip_airspaces([make_item(geometry=polygon(ring))]).problems
+
+    assert problem.endswith("skipped: position 3 is out of range (lon -180 to 180, lat -90 to 90)")
+
+
+def test_coordinates_exactly_on_the_range_limits_are_accepted() -> None:
+    ring = [[-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]]
+
+    airspace = only_airspace(make_item(geometry=polygon(ring)))
+
+    assert airspace.polygon_lonlat[2] == (180.0, 90.0)
+
+
+def test_a_validation_error_is_described_by_its_first_error_and_the_count() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        VerticalLimit(value="x", unit="Q", reference="Z")  # type: ignore[arg-type]
+
+    description = openaip._describe_validation_error(excinfo.value)
+
+    assert description.startswith("value: Input should be a valid number")
+    assert description.endswith(" (and 2 more)")
 
 
 def test_integer_coordinates_are_accepted() -> None:

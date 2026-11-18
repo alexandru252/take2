@@ -482,6 +482,10 @@ def _polygon_ring(geometry: object) -> list[tuple[float, float]]:
         lon, lat = _number(position[0]), _number(position[1])
         if lon is None or lat is None:
             raise _SkipItem(f"position {number} must hold two finite numbers")
+        # Checked here, at the first bad position: the model would report every vertex,
+        # one error object each, which costs hundreds of times the size of the input.
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            raise _SkipItem(f"position {number} is out of range (lon -180 to 180, lat -90 to 90)")
         ring.append((lon, lat))
     if ring and ring[0] != ring[-1]:
         ring.append(ring[0])
@@ -714,11 +718,11 @@ def _describe_item(item: object) -> str:
 
 
 def _describe_validation_error(exc: ValidationError) -> str:
-    """The first validation error only: a broken ring can produce thousands of them."""
-    errors = exc.errors()
-    first = errors[0]
+    """The first validation error and how many others there are."""
+    count = exc.error_count()  # cheap; errors() builds a dict per error
+    first = exc.errors(include_url=False, include_context=False, include_input=False)[0]
     location = ".".join(str(part) for part in first["loc"])
-    more = f" (and {len(errors) - 1} more)" if len(errors) > 1 else ""
+    more = f" (and {count - 1} more)" if count > 1 else ""
     return f"{location}: {first['msg']}{more}"
 
 
