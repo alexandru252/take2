@@ -11,8 +11,8 @@ questions that are not decided yet.
 - **ISA only, no temperature correction.** Flight levels are converted to altitude on QNH
   with the ISA troposphere formula. In cold air your true altitude is lower than indicated;
   Take2 does not correct for that.
-- **No plausibility check on QNH yet.** A QNH typed in the wrong unit (29.92 inHg or
-  101325 Pa) is not rejected by the calculation code.
+- **QNH must be plausible.** The analysis accepts 850 to 1100 hPa, so a QNH typed in the
+  wrong unit (29.92 inHg or 101325 Pa) is refused instead of giving nonsense.
 
 ## Ground-referenced limits
 
@@ -106,6 +106,27 @@ questions that are not decided yet.
   header, never in a URL; error messages are built by Take2 and redacted, and no network
   exception (which holds the request headers) is attached to them.
 
+## Analysis
+
+- **Which airspaces are reported** follows `config/severity.yaml`: classes A to D and
+  prohibited (P) or restricted (R) areas need a clearance (inside is an infringement, within
+  the Take 2 margin a warning); TMZ and RMZ give a requirement when inside; danger areas (D)
+  and ATZ give information when inside. Any other airspace (for example class E, F or G,
+  TRA, TSA, FIR) produces no event. When several rules match, the strictest one decides.
+- **Continuous coverage.** The route is sampled every 0.25 NM at most, and each sample stands
+  for its piece of route (half way to its neighbours, never across a waypoint), so a short
+  incursion between samples, such as clipping a corner, is still found. Event start and end
+  distances are given at sample resolution (0.25 NM).
+- **Self-overlapping polygons** are read with the even-odd rule: an area that a twisted
+  ring covers twice counts as outside. Real airspace boundaries do not cross themselves.
+- **Airspaces wider than 1,500 km** are not supported: an airspace whose nearest vertex is
+  farther from the route than that is skipped, which also avoids the distorted far field of
+  the local projection.
+- **Inverted limits.** An airspace whose lower limit is above its upper limit on the day can
+  never be entered vertically; it is not reported as an infringement.
+- **Run from the source checkout.** The default `config/severity.yaml` is read from the
+  repository, not from an installed package.
+
 ## Input limits
 
 These keep the work bounded when a route file or airspace data comes from someone else.
@@ -139,3 +160,7 @@ required (a test checks this).
 | openAIP request timeouts | 10 s to connect, 30 s per read or write |
 | `.env` file | 1 MB |
 | openAIP API key | 512 visible ASCII characters, no spaces |
+| Positions per airspace polygon | 20,000 |
+| Airspace name | 256 characters |
+| Events per analysis | 10,000 |
+| Severity file | 100 KB, no YAML anchors or aliases, no duplicate keys |

@@ -10,6 +10,10 @@ from typing import assert_never
 from take2.models import LimitReference, VerticalLimit
 
 STANDARD_PRESSURE_HPA = 1013.25
+# Sea-level pressures ever recorded lie between about 870 and 1084 hPa. Outside this range the
+# value was almost certainly typed in another unit (29.92 inHg, 101325 Pa).
+MIN_PLAUSIBLE_QNH_HPA = 850.0
+MAX_PLAUSIBLE_QNH_HPA = 1100.0
 FT_PER_M = 3.28084
 FT_PER_FL = 100.0
 
@@ -28,6 +32,16 @@ def pressure_altitude_of_level_ft(p_hpa: float) -> float:
         raise ValueError(f"pressure must be a positive finite number, got {p_hpa} hPa")
     ratio = p_hpa / STANDARD_PRESSURE_HPA
     return _ISA_PRESSURE_ALTITUDE_SCALE_FT * (1 - ratio**_ISA_PRESSURE_ALTITUDE_EXPONENT)
+
+
+def check_qnh_hpa(qnh_hpa: float) -> float:
+    """Return ``qnh_hpa`` if it is a plausible QNH, else raise ``ValueError``."""
+    if not (math.isfinite(qnh_hpa) and MIN_PLAUSIBLE_QNH_HPA <= qnh_hpa <= MAX_PLAUSIBLE_QNH_HPA):
+        raise ValueError(
+            f"QNH {qnh_hpa} hPa is not plausible: expected {MIN_PLAUSIBLE_QNH_HPA:.0f} to "
+            f"{MAX_PLAUSIBLE_QNH_HPA:.0f} hPa (29.92 inHg is 1013 hPa)"
+        )
+    return qnh_hpa
 
 
 def fl_to_altitude_on_qnh_ft(fl: float, qnh_hpa: float) -> float:

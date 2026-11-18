@@ -1,0 +1,11 @@
+# How airspace states map to event kinds (SPEC.md section 7.4).
+# All three sections are required. When an airspace matches several sections, the
+# strictest wins: clearance_required, then requirement, then info.
+
+clearance_required:      # INSIDE -> INFRINGEMENT, CLOSE -> WARNING
+  classes: [A, B, C, D]
+  types: [P, R]
+requirement:             # INSIDE -> REQUIREMENT (transponder or radio), CLOSE ignored
+  types: [TMZ, RMZ]
+info:                    # INSIDE -> INFO, CLOSE ignored
+  types: [D, ATZ]
