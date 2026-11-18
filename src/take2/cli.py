@@ -5,24 +5,39 @@ user can fix are printed as one ``Error: ...`` line on stderr with exit code 1, 
 traceback.
 """
 
+import math
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 
+from take2.altimetry import check_qnh_hpa
+from take2.analysis import DEFAULT_LATERAL_MARGIN_NM, DEFAULT_VERTICAL_MARGIN_FT, analyze_route
 from take2.io.openaip import (
     ATTRIBUTION,
     OpenAipFetchError,
     OpenAipFileError,
     fetch_airspaces,
+    load_openaip_file,
     normalize_country,
     parse_openaip_airspaces,
     read_api_key,
     save_openaip_file,
 )
+from take2.io.routes import RouteImportError, load_route
+from take2.models import Event
 
 DATA_DIR = Path("data")  # default location of downloaded data, relative to the current dir
+DEFAULT_AIRSPACE_FILE = DATA_DIR / "ro.json"
 MAX_SHOWN_PROBLEMS = 5  # skipped openAIP items listed after a download
+MIN_CRUISE_FT = -1_500.0  # below sea level exists (Dead Sea about -1,400 ft)
+MAX_CRUISE_FT = 60_000.0
+MAX_NAME_CHARS = 32  # airspace names in the event table
+NOT_FOR_NAVIGATION = (
+    "Training tool only. Not for navigation: use official AIP data and approved tools "
+    "for real flights."
+)
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -105,6 +120,151 @@ def fetch_airspace(
     if hidden > 0:
         typer.echo(f"  ... and {hidden} more")
     typer.echo(ATTRIBUTION)
+
+
+@app.command("check")
+def check(
+    route_file: Annotated[
+        Path,
+        typer.Argument(help="Route file: .gpx, .pln (MSFS) or .csv (name,lat,lon,alt_ft)."),
+    ],
+    qnh: Annotated[float, typer.Option(help="QNH of the day in hPa, for example 1013.")],
+    cruise: Annotated[
+        float,
+        typer.Option(help="Cruise altitude in ft AMSL, used for waypoints without an altitude."),
+    ],
+    airspace: Annotated[
+        Path, typer.Option(help="openAIP airspace file written by take2 fetch-airspace.")
+    ] = DEFAULT_AIRSPACE_FILE,
+) -> None:
+    """Check a route against the airspace of the day and list the events."""
+    failure: str | None = None
+    try:
+        check_qnh_hpa(qnh)
+    except ValueError as exc:
+        failure = str(exc)
+    _fail_if(failure)
+    if not (math.isfinite(cruise) and MIN_CRUISE_FT <= cruise <= MAX_CRUISE_FT):
+        _fail(
+            f"cruise altitude {cruise} ft is not plausible: expected {MIN_CRUISE_FT:,.0f} to "
+            f"{MAX_CRUISE_FT:,.0f} ft AMSL"
+        )
+    if not airspace.exists():
+        _fail(
+            f"no airspace data at {airspace}: download it with "
+            "`take2 fetch-airspace --country RO`, or give another file with --airspace"
+        )
+
+    data = None
+    try:
+        data = load_openaip_file(airspace)
+    except OpenAipFileError as exc:
+        failure = f"cannot read {airspace}: {exc}"
+    _fail_if(failure)
+    route = None
+    try:
+        route = load_route(route_file, cruise_alt_ft=cruise)
+    except RouteImportError as exc:
+        failure = f"cannot read {route_file.name}: {exc}"
+    _fail_if(failure)
+    events: list[Event] = []
+    try:
+        events = analyze_route(route, data.airspaces, qnh)
+    except ValueError as exc:
+        failure = str(exc)
+    _fail_if(failure)
+
+    typer.echo(f"Take2 check: {_printable(route_file.name)}, QNH {qnh:g} hPa, cruise {cruise:g} ft")
+    loaded = f"Airspace: {airspace}, {_count(len(data.airspaces), 'airspace')} loaded"
+    if data.skipped:
+        loaded += (
+            f"; {_count(data.skipped, 'airspace item')} could not be used and "
+            f"{'was' if data.skipped == 1 else 'were'} skipped"
+        )
+    typer.echo(loaded)
+    typer.echo("")
+    if events:
+        for line in _event_table(events):
+            typer.echo(line)
+        typer.echo("")
+    for line in _summary(events):
+        typer.echo(line)
+    typer.echo(NOT_FOR_NAVIGATION)
+    typer.echo(ATTRIBUTION)
+
+
+def _event_table(events: list[Event]) -> list[str]:
+    """Aligned rows: number, kind, airspace, extent, minimum distances."""
+    header = ("#", "Kind", "Airspace", "From NM", "To NM", "Lateral NM", "Vertical ft")
+    rows = [
+        (
+            str(number),
+            event.kind,
+            _printable(event.airspace_name)[:MAX_NAME_CHARS],
+            f"{event.start_nm:.1f}",
+            f"{event.end_nm:.1f}",
+            f"{event.min_lateral_nm:.2f}",
+            f"{event.min_vertical_ft:.0f}" + ("~" if event.approximate else ""),
+        )
+        for number, event in enumerate(events, start=1)
+    ]
+    widths = [max(len(row[i]) for row in [header, *rows]) for i in range(len(header))]
+    left_aligned = {1, 2}
+
+    def line(cells: tuple[str, ...]) -> str:
+        return "  ".join(
+            cell.ljust(width) if i in left_aligned else cell.rjust(width)
+            for i, (cell, width) in enumerate(zip(cells, widths, strict=True))
+        ).rstrip()
+
+    return [line(header), *(line(row) for row in rows)]
+
+
+def _summary(events: list[Event]) -> list[str]:
+    """The counts per kind and what they mean for the plan."""
+    if not events:
+        return [
+            "No events: the route keeps the Take 2 margins "
+            f"({DEFAULT_LATERAL_MARGIN_NM:g} NM laterally, {DEFAULT_VERTICAL_MARGIN_FT:g} ft "
+            "vertically) to all loaded airspace."
+        ]
+    counts = Counter(event.kind for event in events)
+    lines = [
+        "Summary: "
+        + ", ".join(
+            [
+                _count(counts["INFRINGEMENT"], "infringement"),
+                _count(counts["WARNING"], "warning"),
+                _count(counts["REQUIREMENT"], "requirement"),
+                f"{counts['INFO']} info",
+            ]
+        )
+        + "."
+    ]
+    if counts["INFRINGEMENT"]:
+        lines.append(
+            "The route enters airspace that needs a clearance: change the route, or plan to "
+            "obtain the clearance."
+        )
+    if counts["WARNING"]:
+        lines.append(
+            "Warnings: the route does not keep the Take 2 margins "
+            f"({DEFAULT_LATERAL_MARGIN_NM:g} NM, {DEFAULT_VERTICAL_MARGIN_FT:g} ft)."
+        )
+    if counts["REQUIREMENT"]:
+        lines.append("Requirements: a transponder or radio requirement applies where listed.")
+    if any(event.approximate for event in events):
+        lines.append("~ approximate: a ground-referenced limit with terrain assumed at 0 ft.")
+    return lines
+
+
+def _printable(text: str) -> str:
+    """Replace characters a terminal could interpret (escape sequences, controls) with '?'."""
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
+def _count(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def _items(count: int) -> str:

@@ -50,6 +50,27 @@ account and its API key.
 openAIP data is maintained by its community and is not the official AIP; see
 [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
+## Checking a route
+
+```sh
+uv run take2 check route.gpx --qnh 998 --cruise 4500
+```
+
+`--qnh` is the QNH of the day in hPa (850 to 1100), `--cruise` the altitude in ft AMSL used for
+waypoints without one, and `--airspace PATH` another airspace file (default `data/ro.json`).
+The command prints one line per event along the route, then a summary:
+
+| Event | Meaning |
+|---|---|
+| INFRINGEMENT | inside airspace that needs a clearance (classes A to D, P, R) |
+| WARNING | not inside, but within the Take 2 margins (2 NM laterally, 200 ft vertically) |
+| REQUIREMENT | inside a TMZ or RMZ (transponder or radio required) |
+| INFO | inside a danger area or ATZ |
+
+Flight-level limits are converted with the QNH you give, so a low QNH brings a flight-level
+base down. A `~` after a vertical distance means a ground-referenced limit was used with the
+terrain assumed at 0 ft.
+
 ## Development
 
 Requirements: [uv](https://docs.astral.sh/uv/). uv installs Python 3.12 automatically.
