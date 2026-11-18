@@ -190,6 +190,20 @@ def test_the_hidden_problem_count_includes_skipped_and_defaulted_items(
 
 
 @pytest.mark.usefixtures("with_key")
+def test_an_unencodable_name_is_saved_and_reported_without_a_crash(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = {"_id": "broken", "name": "FICTIONAL" + chr(0xD800)}  # no limits, no geometry
+    monkeypatch.setattr(cli, "fetch_airspaces", lambda country, api_key: [broken])
+
+    result = run("fetch-airspace", "--country", "RO")
+
+    assert result.exit_code == 0, result.output
+    assert "  item 1 ('FICTIONAL?') skipped: " in result.stdout
+    assert (workdir / "data" / "ro.json").is_file()
+
+
+@pytest.mark.usefixtures("with_key")
 def test_the_country_is_upper_cased_and_the_file_name_lower_cased(
     workdir: Path, fake_fetch: FetchCalls
 ) -> None:

@@ -24,6 +24,7 @@ import re
 import stat
 import tempfile
 import time
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -55,6 +56,7 @@ MAX_OPENAIP_FILE_SIZE = 100_000_000  # bytes
 MAX_OPENAIP_ITEMS = MAX_PAGES * PAGE_SIZE  # 100,000: the most a download can return
 # Positions per ring after closing; the Airspace model accepts no more (MAX_POLYGON_POSITIONS).
 MAX_RING_POSITIONS = 20_000
+MAX_NAME_CHARS = 256  # names and ids; the Airspace model accepts names of at most 256
 MAX_REPORTED_PROBLEMS = 20  # every problem item is counted, but only these are described
 MAX_TYPE_CODE = 999  # openAIP type codes are small; a larger number is read as OTHER
 _ERROR_PREVIEW_CHARS = 40
@@ -65,6 +67,9 @@ _ENV_LINE_RE = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?
 # Starts a comment in an unquoted value: "#" at its start or after whitespace ("a#b" is a value).
 _ENV_COMMENT_RE = re.compile(r"(?:^|\s+)#")
 _clock = time.monotonic  # replaced in tests
+# Unicode categories replaced by "?" in names and ids: control, format, surrogate,
+# private use, unassigned, line separator, paragraph separator.
+_REPLACED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 # openAIP airspace type code -> Take2 type string. P, R, D, CTR, TMZ, RMZ, TMA, ATZ and CTA
 # are matched by the severity configuration, so they must keep these exact spellings.
@@ -261,7 +266,8 @@ def save_openaip_file(path: str | Path, items: list[dict[str, object]], *, count
         "items": items,
     }
     try:
-        text = json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        # ASCII with \u escapes: a lone surrogate from the JSON input has no UTF-8 encoding.
+        text = json.dumps(document, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError, RecursionError) as exc:
         reason = _preview(str(exc), 80)
         raise OpenAipFileError(f"the airspace items cannot be written as JSON: {reason}") from None
@@ -397,10 +403,18 @@ def _convert_item(item: object, index: int, notes: list[str]) -> Airspace:
 
 
 def _text(value: object) -> str | None:
-    """A non-blank string, or None when ``value`` cannot be used as text."""
-    if not isinstance(value, str) or not value.strip():
+    """``value`` as text Take2 can always show and store, or None if it is not usable text.
+
+    At most ``MAX_NAME_CHARS`` characters; control, format, surrogate, private-use,
+    unassigned and line/paragraph separator characters become ``?`` (a lone surrogate
+    cannot even be encoded as UTF-8).
+    """
+    if not isinstance(value, str) or not value or value.isspace():
         return None
-    return value
+    return "".join(
+        "?" if unicodedata.category(character) in _REPLACED_CATEGORIES else character
+        for character in value[:MAX_NAME_CHARS]
+    )
 
 
 def _airspace_type(value: object, notes: list[str]) -> str:
@@ -731,8 +745,8 @@ def _describe_http_error(exc: httpx.HTTPError, api_key: str) -> str:
 
 
 def _describe_item(item: object) -> str:
-    name = item.get("name") if isinstance(item, dict) else None
-    return f" ({_preview(name)!r})" if isinstance(name, str) and name else ""
+    name = _text(item.get("name")) if isinstance(item, dict) else None
+    return f" ({_preview(name)!r})" if name else ""
 
 
 def _describe_validation_error(exc: ValidationError) -> str:

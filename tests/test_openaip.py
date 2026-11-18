@@ -598,6 +598,60 @@ def test_a_huge_integer_code_is_not_echoed(item: object) -> None:
     assert len(problem) < 200
 
 
+# --- names and ids are text Take2 can always show ---------------------------------
+
+# One character of each replaced Unicode category, built from code points.
+REPLACED_CHARACTERS = {
+    "tab (Cc)": chr(0x09),
+    "NUL (Cc)": chr(0x00),
+    "zero-width space (Cf)": chr(0x200B),
+    "right-to-left override (Cf)": chr(0x202E),
+    "lone surrogate (Cs)": chr(0xD800),
+    "private use (Co)": chr(0xE000),
+    "unassigned (Cn)": chr(0x0378),
+    "line separator (Zl)": chr(0x2028),
+    "paragraph separator (Zp)": chr(0x2029),
+}
+
+
+@pytest.mark.parametrize("character", REPLACED_CHARACTERS.values(), ids=REPLACED_CHARACTERS.keys())
+def test_unprintable_characters_in_names_and_ids_become_question_marks(character: str) -> None:
+    item = make_item(_id=f"fic{character}tional", name=f"FICTIONAL{character}CTR")
+
+    airspace = only_airspace(item)
+
+    assert airspace.name == "FICTIONAL?CTR"
+    assert airspace.id == "fic?tional"
+
+
+def test_letters_of_other_scripts_are_kept() -> None:
+    name = "FICTIONAL " + "".join(map(chr, [0x218, 0x102, 0xCE, 0x3A9]))  # Ș Ă Î Ω
+
+    assert only_airspace(make_item(name=name)).name == name
+
+
+def test_names_and_ids_are_cut_to_256_characters() -> None:
+    airspace = only_airspace(make_item(_id="i" * 300, name="N" * 300))
+
+    assert airspace.name == "N" * 256
+    assert airspace.id == "i" * 256
+
+
+def test_a_name_of_unprintable_characters_is_kept_not_skipped() -> None:
+    airspace = only_airspace(make_item(name=chr(0xD800) + chr(0x200B)))
+
+    assert airspace.name == "??"
+
+
+def test_a_problem_line_never_contains_an_unencodable_character() -> None:
+    item = make_item(name="FICTIONAL" + chr(0xD800), geometry=MISSING)
+
+    (problem,) = parse_openaip_airspaces([item]).problems
+
+    assert "'FICTIONAL?'" in problem
+    problem.encode("utf-8")  # a lone surrogate would raise UnicodeEncodeError here
+
+
 # --- duplicate ids ----------------------------------------------------------------
 
 
@@ -1565,7 +1619,7 @@ def test_a_saved_file_carries_the_attribution_country_and_raw_items(tmp_path: Pa
     save_openaip_file(path, items, country="ro")
 
     data = path.read_bytes()
-    assert "FICTIONAL ȘOIM CTR".encode() in data  # UTF-8, not \u escapes
+    assert data.isascii()  # non-ASCII text is written as JSON escapes
     document = json.loads(data)
     assert document["attribution"] == ATTRIBUTION
     assert document["country"] == "RO"
@@ -1573,6 +1627,16 @@ def test_a_saved_file_carries_the_attribution_country_and_raw_items(tmp_path: Pa
     fetched_at = datetime.fromisoformat(document["fetchedAt"])
     assert fetched_at.utcoffset() == timedelta(0)
     assert abs(datetime.now(UTC) - fetched_at) < timedelta(minutes=5)
+
+
+def test_a_lone_surrogate_in_the_raw_items_is_saved_and_loads_back(tmp_path: Path) -> None:
+    name = "FICTIONAL" + chr(0xD800)  # JSON can carry "\ud800"; UTF-8 cannot encode it
+    path = tmp_path / "ro.json"
+
+    save_openaip_file(path, [make_item(name=name)], country="RO")
+
+    assert json.loads(path.read_bytes())["items"][0]["name"] == name  # raw item unchanged
+    assert load_openaip_file(path).airspaces[0].name == "FICTIONAL?"
 
 
 def test_the_attribution_text() -> None:
