@@ -50,6 +50,10 @@ _DMS_RE = re.compile(
 )
 # A plain decimal number. float() also accepts "4_4.5", "nan", "inf" and non-ASCII digits.
 _NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
+# One complete CSV record on one line: a field is either quoted as a whole ("..." with ""
+# for a quote) or contains no quote at all, and no field contains a line break.
+_CSV_FIELD = r'(?:"(?:[^"\r\n]|"")*"|[^",\r\n]*)'
+_CSV_LINE_RE = re.compile(rf"{_CSV_FIELD}(?:,{_CSV_FIELD})*\r?\n?")
 _GPX_NAMESPACES = frozenset(
     {"http://www.topografix.com/GPX/1/1", "http://www.topografix.com/GPX/1/0", ""}
 )
@@ -259,16 +263,18 @@ def _parse_dms(text: str, hemispheres: str) -> float:
 def _csv_records(text: str) -> Iterator[tuple[int, list[str]]]:
     """Yield ``(line number, fields)`` per CSV record; csv errors become RouteImportError."""
     text = text.removeprefix("\ufeff")
-    # Check each physical line before the csv module builds a row: it allocates every field
-    # first. Quoted line breaks are refused, so a record is always exactly one line.
+    # Check each physical line before the csv module builds a row (it allocates every field
+    # first). Each line must be one complete record on its own, so csv can never join lines
+    # into one record, and so a record has at most MAX_CSV_FIELDS fields.
     for number, line in enumerate(io.StringIO(text), start=1):
-        if line.count('"') % 2:
-            raise RouteImportError(
-                f"CSV line {number}: line breaks inside quoted fields are not supported"
-            )
         if line.count(",") >= MAX_CSV_FIELDS:
             raise RouteImportError(f"CSV line {number} has more than {MAX_CSV_FIELDS} fields")
-    reader = csv.reader(io.StringIO(text))
+        if not _CSV_LINE_RE.fullmatch(line):
+            raise RouteImportError(
+                f"CSV line {number} is not a valid record: quotes must enclose a whole field "
+                "and line breaks inside fields are not supported"
+            )
+    reader = csv.reader(io.StringIO(text), strict=True)
     while True:
         try:
             fields = next(reader)
@@ -276,6 +282,10 @@ def _csv_records(text: str) -> Iterator[tuple[int, list[str]]]:
             return
         except csv.Error as exc:
             raise RouteImportError(f"CSV line {reader.line_num}: {exc}") from exc
+        if len(fields) > MAX_CSV_FIELDS:  # unreachable after the line check; kept as a net
+            raise RouteImportError(
+                f"CSV line {reader.line_num} has more than {MAX_CSV_FIELDS} fields"
+            )
         yield reader.line_num, fields
 
 

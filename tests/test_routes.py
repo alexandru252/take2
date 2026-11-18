@@ -1080,3 +1080,31 @@ def test_csv_quoted_line_breaks_are_rejected() -> None:
 
     with pytest.raises(RouteImportError, match="line break"):
         parse_csv(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_csv_record_cannot_span_lines_through_a_literal_quote() -> None:
+    # Each line has an even number of quotes and fewer than 64 commas, but the csv module
+    # reads 'A"x' as a literal quote and then opens a quoted field with the last '"', so
+    # every following line would join one record with tens of thousands of fields.
+    lines = 'A"x,"\n' + ('",' + "," * 60 + '"\n') * 50_000
+    text = "name,lat,lon,alt_ft\n" + lines + "B,44.6,26.1,\n"
+    tracemalloc.start()
+    try:
+        with pytest.raises(RouteImportError, match="CSV line 2"):
+            parse_csv(text, cruise_alt_ft=CRUISE_FT)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 20_000_000
+
+
+@pytest.mark.parametrize(
+    "row",
+    ['"Bucharest, North",44.5,26.0,', '"He said ""hi""",44.5,26.0,', "A,44.5,26.0,1000\r"],
+    ids=["comma-in-quotes", "escaped-quotes", "windows-line-end"],
+)
+def test_csv_properly_quoted_fields_are_accepted(row: str) -> None:
+    route = parse_csv(f"name,lat,lon,alt_ft\n{row}\nB,44.6,26.1,\n", cruise_alt_ft=CRUISE_FT)
+
+    assert route.waypoints[0].lat == 44.5
