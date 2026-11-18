@@ -258,7 +258,17 @@ def _parse_dms(text: str, hemispheres: str) -> float:
 
 def _csv_records(text: str) -> Iterator[tuple[int, list[str]]]:
     """Yield ``(line number, fields)`` per CSV record; csv errors become RouteImportError."""
-    reader = csv.reader(io.StringIO(text.removeprefix("\ufeff")))
+    text = text.removeprefix("\ufeff")
+    # Check each physical line before the csv module builds a row: it allocates every field
+    # first. Quoted line breaks are refused, so a record is always exactly one line.
+    for number, line in enumerate(io.StringIO(text), start=1):
+        if line.count('"') % 2:
+            raise RouteImportError(
+                f"CSV line {number}: line breaks inside quoted fields are not supported"
+            )
+        if line.count(",") >= MAX_CSV_FIELDS:
+            raise RouteImportError(f"CSV line {number} has more than {MAX_CSV_FIELDS} fields")
+    reader = csv.reader(io.StringIO(text))
     while True:
         try:
             fields = next(reader)
@@ -266,10 +276,6 @@ def _csv_records(text: str) -> Iterator[tuple[int, list[str]]]:
             return
         except csv.Error as exc:
             raise RouteImportError(f"CSV line {reader.line_num}: {exc}") from exc
-        if len(fields) > MAX_CSV_FIELDS:
-            raise RouteImportError(
-                f"CSV line {reader.line_num} has more than {MAX_CSV_FIELDS} fields"
-            )
         yield reader.line_num, fields
 
 
@@ -362,8 +368,8 @@ def _parse_xml(text: str, file_type: str) -> ET.Element:
     _check_xml(text, file_type)
     try:
         return ET.fromstring(text)
-    # Reachable: _check_xml does not process namespaces, so an undeclared prefix or an
-    # attribute duplicated through two prefixes only fails here. Keep this handler.
+    # A safety net: _check_xml now processes namespaces like ElementTree, but the two parsers
+    # are configured separately, so keep converting any ParseError.
     except ET.ParseError as exc:
         raise RouteImportError(f"invalid {file_type} file (XML error): {exc}") from exc
 
@@ -378,16 +384,26 @@ def _check_xml(text: str, file_type: str) -> None:
     route files never need a DTD. expat reports elements through callbacks, so deep nesting
     cannot overflow the stack here.
     """
-    parser = xml.parsers.expat.ParserCreate()
+    # Namespace processing as in ElementTree, so names are counted as ElementTree caches them
+    # ("uri}local"); namespace declarations then arrive through their own callback.
+    parser = xml.parsers.expat.ParserCreate(namespace_separator="}")
     depth = 0
     elements = 0
+    declarations = 0  # namespace declarations on the element being started
     names: set[str] = set()
+
+    def start_namespace(_prefix: str | None, uri: str) -> None:
+        nonlocal declarations
+        declarations += 1
+        names.add(uri)
 
     def start_doctype(*_: object) -> None:
         raise RouteImportError(f"{file_type} file contains a DOCTYPE, which is not allowed")
 
     def start_element(name: str, attributes: dict[str, str]) -> None:
-        nonlocal depth, elements
+        nonlocal depth, elements, declarations
+        attribute_count = len(attributes) + declarations
+        declarations = 0
         depth += 1
         elements += 1
         if depth > MAX_XML_DEPTH:
@@ -396,7 +412,7 @@ def _check_xml(text: str, file_type: str) -> None:
             )
         if elements > MAX_XML_ELEMENTS:
             raise RouteImportError(f"{file_type} file has more than {MAX_XML_ELEMENTS:,} elements")
-        if len(attributes) > MAX_XML_ATTRIBUTES:
+        if attribute_count > MAX_XML_ATTRIBUTES:
             raise RouteImportError(
                 f"{file_type} file has an element with more than {MAX_XML_ATTRIBUTES} attributes"
             )
@@ -414,6 +430,7 @@ def _check_xml(text: str, file_type: str) -> None:
         depth -= 1
 
     parser.StartDoctypeDeclHandler = start_doctype
+    parser.StartNamespaceDeclHandler = start_namespace
     parser.StartElementHandler = start_element
     parser.EndElementHandler = end_element
     try:

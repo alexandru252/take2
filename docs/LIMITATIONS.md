@@ -67,6 +67,7 @@ required (a test checks this).
 | XML attributes per element (GPX, `.pln`) | 64 |
 | Distinct XML element and attribute names (GPX, `.pln`) | 1,000 |
 | CSV fields per row | 64 |
+| Line breaks inside quoted CSV fields | not allowed |
 | DOCTYPE / DTD in GPX or `.pln` | not allowed |
 | Route length | 1,000 NM |
 | Route samples | 100,000 |

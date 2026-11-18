@@ -1046,3 +1046,37 @@ def test_expat_has_the_large_allocation_fix() -> None:
     import pyexpat
 
     assert pyexpat.version_info >= (2, 7, 2)
+
+
+# --- automated security review of the limits above ---------------------------------
+
+
+def test_names_are_counted_the_way_elementtree_sees_them() -> None:
+    # One prefix bound to 1,001 different namespaces: 3 raw names, but 1,001 distinct
+    # expanded names in ElementTree's cache.
+    extras = "".join(f'<p:x xmlns:p="urn:take2:{i}"/>' for i in range(1_001))
+    text = gpx_document(f"<rte>{TWO_RTEPTS}</rte><x>{extras}</x>")
+
+    with pytest.raises(RouteImportError, match="names"):
+        parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_csv_row_with_millions_of_fields_is_rejected_before_parsing() -> None:
+    text = "name,lat,lon,alt_ft\nA,44.5,26.0," + "," * 2_000_000 + "\nB,44.6,26.1,\n"
+    tracemalloc.start()
+    try:
+        with pytest.raises(RouteImportError, match="fields"):
+            parse_csv(text, cruise_alt_ft=CRUISE_FT)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 20_000_000  # letting csv build the row used ~100 bytes per field
+
+
+def test_csv_quoted_line_breaks_are_rejected() -> None:
+    # A record spanning lines could hide many fields from a per-line check.
+    text = 'name,lat,lon,alt_ft\n"A\nB",44.5,26.0,\nC,44.6,26.1,\n'
+
+    with pytest.raises(RouteImportError, match="line break"):
+        parse_csv(text, cruise_alt_ft=CRUISE_FT)
