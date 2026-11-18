@@ -670,19 +670,22 @@ def _download_page(
                         status_code=response.status_code,
                     )
             return bytes(body)
+    # The error is built here and raised after the except blocks, so it carries no
+    # __context__: the httpx exception holds the request, and the request the key header.
     except httpx.TimeoutException:
-        raise OpenAipFetchError("openAIP did not answer in time; try again later") from None
+        error = OpenAipFetchError("openAIP did not answer in time; try again later")
     except httpx.HTTPError as exc:
-        raise OpenAipFetchError(
-            f"cannot reach openAIP: {_describe_http_error(exc, api_key)}"
-        ) from None
+        error = OpenAipFetchError(f"cannot reach openAIP: {_describe_http_error(exc, api_key)}")
+    raise error
 
 
 def _check_status(status: int) -> None:
     if status == 200:
         return
     if status in (401, 403):
-        raise OpenAipFetchError(f"openAIP rejected the API key (HTTP {status})", status)
+        raise OpenAipFetchError(
+            f"openAIP rejected the API key (HTTP {status}); check {API_KEY_ENV_VAR}", status
+        )
     hint = {
         # Observed on the live API: an unknown key gets 404 ("Failed to load user
         # permissions"), not 401/403. The URL is fixed, so the key is the likely cause.
@@ -716,10 +719,13 @@ def _too_large(page: int, limit_bytes: int, total_left: int) -> OpenAipFetchErro
 
 def _read_page(data: bytes, page: int) -> tuple[list[dict[str, object]], bool]:
     """The items of one page, and whether another page follows."""
+    reason: str | None = None
     try:
         document = _parse_json(data)
     except ValueError as exc:
-        raise OpenAipFetchError(f"openAIP page {page} is {exc}", status_code=200) from None
+        reason = str(exc)
+    if reason is not None:  # raised outside the except block: no __context__ attached
+        raise OpenAipFetchError(f"openAIP page {page} is {reason}", status_code=200)
     if not isinstance(document, dict):
         raise OpenAipFetchError(
             f"unexpected openAIP response on page {page}: expected a JSON object", 200

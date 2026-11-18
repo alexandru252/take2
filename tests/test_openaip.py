@@ -1231,7 +1231,9 @@ def test_a_rejected_api_key_is_reported_with_the_status(status: int) -> None:
     with pytest.raises(OpenAipFetchError) as excinfo:
         fetch_with(respond(httpx.Response(status, json={"message": "invalid key"})))
 
-    assert str(excinfo.value) == f"openAIP rejected the API key (HTTP {status})"
+    assert str(excinfo.value) == (
+        f"openAIP rejected the API key (HTTP {status}); check OPENAIP_API_KEY"
+    )
     assert excinfo.value.status_code == status
     assert_key_not_shown(excinfo.value)
 
@@ -1584,9 +1586,30 @@ def test_no_failure_shows_the_key_in_its_message_repr_or_traceback(handler: Hand
         fetch_with(handler)
 
     assert_key_not_shown(excinfo.value)
-    # No chained httpx exception (which holds the request and its headers) is displayed.
+    # No httpx exception (which holds the request and its key header) stays attached,
+    # not even as a suppressed context.
     assert excinfo.value.__cause__ is None
-    assert excinfo.value.__context__ is None or excinfo.value.__suppress_context__
+    assert excinfo.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        raise_error(httpx.ConnectError("refused")),
+        raise_error(httpx.ReadTimeout("slow")),
+        raise_error(httpx.DecodingError("bad gzip")),
+        respond(httpx.Response(200, content=b"not json")),
+        respond(httpx.Response(200, content=b"[" * 100_000)),
+        respond(httpx.Response(200, content=b"\xff\xfe")),
+    ],
+    ids=["connect", "timeout", "decoding", "bad JSON", "deep JSON", "not UTF-8"],
+)
+def test_a_download_error_carries_no_other_exception(handler: Handler) -> None:
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(handler)
+
+    assert excinfo.value.__context__ is None
+    assert excinfo.value.__cause__ is None
 
 
 def test_logging_during_a_fetch_never_shows_the_key(caplog: pytest.LogCaptureFixture) -> None:

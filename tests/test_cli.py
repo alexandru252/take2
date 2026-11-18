@@ -1,17 +1,22 @@
 """Tests for the take2 command line (SPEC.md section 8).
 
 No test touches the network: ``fetch_airspaces`` is replaced by a fake that returns the
-fictional fixture. The API key is a made-up string.
+fictional fixture, or the real one runs over an ``httpx.MockTransport``. The API key is a
+made-up string.
 """
 
 import json
+from collections.abc import Callable
 from importlib.metadata import entry_points
 from pathlib import Path
 
+import httpx
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from take2 import cli
+from take2.io import openaip
 from take2.io.openaip import ATTRIBUTION, OpenAipFetchError, load_openaip_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "openaip_airspaces.json"
@@ -60,6 +65,16 @@ def failing_fetch(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
         raise error
 
     monkeypatch.setattr(cli, "fetch_airspaces", fetch)
+
+
+def serve(monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]):
+    """Keep the real fetch_airspaces, but give its own httpx client a mock transport."""
+    real_client = httpx.Client
+
+    def make_client(**kwargs: object) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(openaip.httpx, "Client", make_client)
 
 
 # --- the app ----------------------------------------------------------------------
@@ -292,18 +307,51 @@ def test_country_is_required(workdir: Path) -> None:
 
 
 @pytest.mark.usefixtures("with_key")
-@pytest.mark.parametrize("status", [401, 403])
-def test_a_rejected_key_exits_1_with_a_hint_and_saves_nothing(
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_rejected_key_exits_1_with_the_hint_once_and_saves_nothing(
     workdir: Path, monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
-    error = OpenAipFetchError(f"openAIP rejected the API key (HTTP {status})", status)
-    failing_fetch(monkeypatch, error)
+    serve(monkeypatch, lambda request: httpx.Response(status))  # the real fetch_airspaces
 
     result = run("fetch-airspace", "--country", "RO")
 
-    assert_clean_failure(result, expected=f"openAIP rejected the API key (HTTP {status})")
-    assert "check OPENAIP_API_KEY" in result.stderr
+    assert_clean_failure(result, expected=f"HTTP {status}")
+    assert result.stderr.count("check OPENAIP_API_KEY") == 1
     assert list(workdir.iterdir()) == []
+
+
+@pytest.mark.usefixtures("with_key")
+@pytest.mark.parametrize(
+    "failure",
+    ["invalid country", "unreadable .env", "download", "unusable key", "empty", "save"],
+)
+def test_a_failure_exit_carries_no_exception_context(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    # typer.Exit raised inside an except block would keep the caught error (and through
+    # its traceback, frames holding the key) as __context__.
+    country, output = "RO", None
+    if failure == "invalid country":
+        country = "ROU"
+    elif failure == "unreadable .env":
+        monkeypatch.delenv("OPENAIP_API_KEY")
+        (workdir / ".env").write_text('OPENAIP_API_KEY="unclosed\n', encoding="utf-8")
+    elif failure == "download":
+        failing_fetch(monkeypatch, OpenAipFetchError("openAIP request failed with HTTP 500"))
+    elif failure == "unusable key":
+        failing_fetch(monkeypatch, ValueError("the openAIP API key is empty"))
+    elif failure == "empty":
+        monkeypatch.setattr(cli, "fetch_airspaces", lambda country, api_key: [])
+    else:
+        monkeypatch.setattr(cli, "fetch_airspaces", lambda country, api_key: fixture_items())
+        output = workdir / "taken"
+        output.mkdir()
+
+    with pytest.raises(typer.Exit) as excinfo:
+        cli.fetch_airspace(country=country, output=output)
+
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.__context__ is None
 
 
 @pytest.mark.usefixtures("with_key")

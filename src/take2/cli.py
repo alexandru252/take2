@@ -50,27 +50,34 @@ def fetch_airspace(
     The API key is read from the OPENAIP_API_KEY environment variable or from a .env file
     in the current directory.
     """
+    # Each failure is turned into a message inside its except block and _fail() is called
+    # after it, so typer.Exit carries no __context__ (whose traceback frames hold the key).
+    failure: str | None = None
     try:
         country = normalize_country(country)
     except ValueError as exc:
-        _fail(str(exc))
+        failure = str(exc)
+    _fail_if(failure)
+
+    api_key: str | None = None
     try:
         api_key = read_api_key()
     except (OSError, ValueError) as exc:
-        _fail(f"cannot read the openAIP API key: {exc}")
+        failure = f"cannot read the openAIP API key: {exc}"
+    _fail_if(failure)
     if api_key is None:
         _fail(
             "no openAIP API key found. Set OPENAIP_API_KEY in the environment or in a .env "
             "file in the current directory (see .env.example)."
         )
 
+    items: list[dict[str, object]] = []
     try:
         items = fetch_airspaces(country, api_key)
-    except OpenAipFetchError as exc:
-        hint = " (check OPENAIP_API_KEY)" if exc.status_code in (401, 403) else ""
-        _fail(f"{exc}{hint}")
-    except ValueError as exc:  # an API key that cannot be sent
-        _fail(str(exc))
+    except (OpenAipFetchError, ValueError) as exc:  # ValueError: a key that cannot be sent
+        failure = str(exc)  # the message already says when to check OPENAIP_API_KEY
+    del api_key  # not needed any more
+    _fail_if(failure)
     if not items:
         _fail(f"openAIP returned no airspaces for {country}; nothing was saved")
 
@@ -78,9 +85,10 @@ def fetch_airspace(
     try:
         save_openaip_file(path, items, country=country)
     except OpenAipFileError as exc:
-        _fail(f"cannot save {path}: {exc}")
+        failure = f"cannot save {path}: {exc}"
     except OSError as exc:
-        _fail(f"cannot save {path}: {exc.strerror or exc}")
+        failure = f"cannot save {path}: {exc.strerror or exc}"
+    _fail_if(failure)
 
     result = parse_openaip_airspaces(items)
     typer.echo(f"Saved {len(items)} openAIP airspaces for {country} to {path}.")
@@ -107,3 +115,9 @@ def _fail(message: str) -> NoReturn:
     """Print ``Error: message`` on stderr and exit with code 1."""
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=1)
+
+
+def _fail_if(message: str | None) -> None:
+    """``_fail(message)`` when there is a message; call it outside any except block."""
+    if message is not None:
+        _fail(message)
