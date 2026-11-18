@@ -52,6 +52,9 @@ MAX_ENV_FILE_SIZE = 1_000_000  # bytes; a .env file is a few lines
 
 # Generous on purpose (room for large countries); it bounds what a hostile file can cost.
 MAX_OPENAIP_FILE_SIZE = 100_000_000  # bytes
+MAX_OPENAIP_ITEMS = MAX_PAGES * PAGE_SIZE  # 100,000: the most a download can return
+# Positions per ring after closing; the Airspace model accepts no more (MAX_POLYGON_POSITIONS).
+MAX_RING_POSITIONS = 20_000
 MAX_REPORTED_PROBLEMS = 20  # every problem item is counted, but only these are described
 MAX_TYPE_CODE = 999  # openAIP type codes are small; a larger number is read as OTHER
 _ERROR_PREVIEW_CHARS = 40
@@ -229,6 +232,8 @@ def load_openaip_file(path: str | Path) -> ParseResult:
         raise OpenAipFileError(
             f"{name}: expected a list of openAIP items or an object with an 'items' list"
         )
+    if len(items) > MAX_OPENAIP_ITEMS:
+        raise OpenAipFileError(f"{name} has more than {MAX_OPENAIP_ITEMS:,} items")
     return parse_openaip_airspaces(items)
 
 
@@ -245,6 +250,10 @@ def save_openaip_file(path: str | Path, items: list[dict[str, object]], *, count
     fails.
     """
     path = Path(path)
+    if len(items) > MAX_OPENAIP_ITEMS:
+        raise OpenAipFileError(
+            f"more than {MAX_OPENAIP_ITEMS:,} items: the file could not be read back"
+        )
     document = {
         "attribution": ATTRIBUTION,
         "country": normalize_country(country),
@@ -475,6 +484,9 @@ def _polygon_ring(geometry: object) -> list[tuple[float, float]]:
     rings = geometry.get("coordinates")
     if not isinstance(rings, list) or len(rings) != 1 or not isinstance(rings[0], list):
         raise _SkipItem("a Polygon must have exactly one ring (holes are not supported)")
+    too_long = f"the ring has more than {MAX_RING_POSITIONS:,} positions after closing"
+    if len(rings[0]) > MAX_RING_POSITIONS:  # before converting a single position
+        raise _SkipItem(too_long)
     ring: list[tuple[float, float]] = []
     for number, position in enumerate(rings[0], start=1):
         if not isinstance(position, list | tuple) or len(position) != 2:
@@ -489,6 +501,8 @@ def _polygon_ring(geometry: object) -> list[tuple[float, float]]:
         ring.append((lon, lat))
     if ring and ring[0] != ring[-1]:
         ring.append(ring[0])
+        if len(ring) > MAX_RING_POSITIONS:
+            raise _SkipItem(too_long)
     return ring
 
 
@@ -688,6 +702,10 @@ def _read_page(data: bytes, page: int) -> tuple[list[dict[str, object]], bool]:
     items = document.get("items")
     if not isinstance(items, list):
         raise OpenAipFetchError(f"unexpected openAIP response on page {page}: no 'items' list", 200)
+    if len(items) > PAGE_SIZE:  # more than requested: the item cap of a download must hold
+        raise OpenAipFetchError(
+            f"unexpected openAIP response on page {page}: more than {PAGE_SIZE:,} items", 200
+        )
     if not all(isinstance(item, dict) for item in items):
         raise OpenAipFetchError(
             f"unexpected openAIP response on page {page}: every item must be a JSON object", 200

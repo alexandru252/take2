@@ -33,10 +33,12 @@ from take2.io.openaip import (
     MAX_DOWNLOAD_BYTES,
     MAX_ENV_FILE_SIZE,
     MAX_OPENAIP_FILE_SIZE,
+    MAX_OPENAIP_ITEMS,
     MAX_PAGE_BYTES,
     MAX_PAGE_SECONDS,
     MAX_PAGES,
     MAX_REPORTED_PROBLEMS,
+    MAX_RING_POSITIONS,
     PAGE_SIZE,
     REFERENCE_BY_CODE,
     REQUEST_TIMEOUT,
@@ -344,6 +346,53 @@ def test_the_first_out_of_range_position_is_named(position: list[float]) -> None
     (problem,) = parse_openaip_airspaces([make_item(geometry=polygon(ring))]).problems
 
     assert problem.endswith("skipped: position 3 is out of range (lon -180 to 180, lat -90 to 90)")
+
+
+def test_max_ring_positions_is_20_000() -> None:
+    assert MAX_RING_POSITIONS == 20_000
+
+
+def line_ring(positions: int, *, closed: bool) -> list[list[float]]:
+    """A ring of exactly ``positions`` positions (the last repeats the first if closed)."""
+    distinct = positions - 1 if closed else positions
+    ring = [[26.0 + n * 1e-6, 44.4 + (n % 2) * 1e-6] for n in range(distinct)]
+    return ring + [ring[0]] if closed else ring
+
+
+@pytest.mark.parametrize(
+    ("positions", "closed", "kept"),
+    [(20_000, True, True), (19_999, False, True), (20_000, False, False), (20_001, True, False)],
+    ids=["20,000 closed", "19,999 open", "20,000 open", "20,001 closed"],
+)
+def test_a_ring_may_have_at_most_20_000_positions_after_closing(
+    positions: int, closed: bool, kept: bool
+) -> None:
+    result = parse_openaip_airspaces(
+        [make_item(geometry=polygon(line_ring(positions, closed=closed)))]
+    )
+
+    if kept:
+        assert len(result.airspaces[0].polygon_lonlat) == 20_000
+    else:
+        assert result.airspaces == []
+        assert result.problems[0].endswith(
+            "skipped: the ring has more than 20,000 positions after closing"
+        )
+
+
+def test_a_huge_ring_is_skipped_before_it_is_converted() -> None:
+    ring = [[26.0, 44.4]] * 1_000_000
+    item = make_item(geometry=polygon(ring))
+
+    tracemalloc.start()
+    try:
+        result = parse_openaip_airspaces([item])
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.skipped == 1
+    assert peak_bytes < 500_000  # a million (lon, lat) tuples would take about 70 MB
 
 
 def test_coordinates_exactly_on_the_range_limits_are_accepted() -> None:
@@ -847,6 +896,24 @@ def test_max_openaip_file_size_is_100_000_000_bytes() -> None:
     assert MAX_OPENAIP_FILE_SIZE == 100_000_000
 
 
+def test_max_openaip_items_is_what_a_full_download_can_return() -> None:
+    assert MAX_OPENAIP_ITEMS == 100_000 == MAX_PAGES * PAGE_SIZE
+
+
+@pytest.mark.parametrize(("count", "accepted"), [(3, True), (4, False)])
+def test_load_accepts_at_most_max_openaip_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, accepted: bool
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_OPENAIP_ITEMS", 3)
+    path = write_json(tmp_path / "many.json", [make_item(_id=f"i{n}") for n in range(count)])
+
+    if accepted:
+        assert len(load_openaip_file(path).airspaces) == 3
+    else:
+        with pytest.raises(OpenAipFileError, match="many.json has more than 3 items"):
+            load_openaip_file(path)
+
+
 @pytest.mark.parametrize(("extra", "accepted"), [(0, True), (1, False)])
 def test_load_accepts_a_file_of_exactly_the_size_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: int, accepted: bool
@@ -1210,6 +1277,18 @@ def test_a_malformed_response_is_reported_not_raised_raw(content: bytes, match: 
 
     assert excinfo.value.status_code == 200
     assert len(str(excinfo.value)) < 200
+
+
+@pytest.mark.parametrize(("count", "accepted"), [(PAGE_SIZE, True), (PAGE_SIZE + 1, False)])
+def test_a_page_may_hold_at_most_page_size_items(count: int, accepted: bool) -> None:
+    body = {"items": [{"_id": f"i{n}"} for n in range(count)]}
+    handler = respond(httpx.Response(200, json=body))
+
+    if accepted:
+        assert len(fetch_with(handler)) == PAGE_SIZE
+    else:
+        with pytest.raises(OpenAipFetchError, match="more than 1,000 items"):
+            fetch_with(handler)
 
 
 def test_next_page_null_means_the_last_page() -> None:
@@ -1581,6 +1660,18 @@ def test_data_too_large_to_read_back_is_not_saved(
 
     with pytest.raises(OpenAipFileError, match="larger than 1,000 bytes"):
         save_openaip_file(path, [make_item(_id=f"i{n}") for n in range(10)], country="RO")
+
+    assert not path.exists()
+
+
+def test_more_items_than_a_file_may_hold_are_not_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_OPENAIP_ITEMS", 3)
+    path = tmp_path / "ro.json"
+
+    with pytest.raises(OpenAipFileError, match="more than 3 items"):
+        save_openaip_file(path, [make_item(_id=f"i{n}") for n in range(4)], country="RO")
 
     assert not path.exists()
 
