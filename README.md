@@ -42,8 +42,10 @@ account and its API key.
    ```
 
    This saves `data/ro.json` (also git-ignored); `--output PATH` saves elsewhere. The command
-   prints how many airspaces it saved and lists the ones Take2 cannot use (for example a
-   geometry other than a polygon). Run it again to refresh the data.
+   prints how many airspaces it saved, lists the ones Take2 cannot use (for example a
+   geometry other than a polygon) and the ones it reads with a default (for example an
+   unknown airspace class). The file is readable only by you. Run the command again to
+   refresh the data.
 
 openAIP data is maintained by its community and is not the official AIP; see
 [docs/LIMITATIONS.md](docs/LIMITATIONS.md).

@@ -63,29 +63,48 @@ questions that are not decided yet.
 - **Only single-ring polygons.** openAIP describes an airspace as a GeoJSON `Polygon` with
   one ring. An item with another geometry type, or with a hole, is skipped. An open ring is
   closed by repeating its first position. Whether a polygon crosses itself is not checked.
-- **Unknown type codes are kept** as `TYPE_<n>` (for example `TYPE_37`). Such an airspace is
-  loaded, but no rule in the severity configuration matches it.
-- **Class 8 means unclassified.** openAIP code 8 ("Unclassified / Special Use Airspace")
-  becomes "no ICAO class", so only the airspace type decides whether a clearance is needed.
-- **Skipped items.** An item is skipped, counted and reported (the first 20 are described)
-  instead of failing the whole file when:
-  - it is not a JSON object, or `_id` or `name` is missing or not a non-empty string;
-  - `type` or `icaoClass` is missing or not a whole number of at least 0 (`true`/`false`
-    do not count), `type` is 1000 or more, or `icaoClass` is not 0 to 6 or 8;
+- **Skipped only when Take2 cannot know where the airspace is.** An item is skipped,
+  counted and reported instead of failing the whole file when:
+  - it is not a JSON object;
   - `lowerLimit` or `upperLimit` is missing, its `value` is not a finite number, its `unit`
     is not 0 (metres), 1 (feet) or 6 (flight level), or its `referenceDatum` is not
     0 (GND), 1 (MSL) or 2 (STD);
   - the geometry is not a single-ring `Polygon`, a position is not exactly `[lon, lat]`,
-    a coordinate is out of range, or the closed ring has fewer than 4 positions;
-  - its `_id` was already seen earlier in the file.
+    a coordinate is outside -180 to 180 (lon) or -90 to 90 (lat), or the closed ring has
+    fewer than 4 or more than 20,000 positions;
+  - it repeats an earlier item exactly (same `_id`, same content).
+- **Read with a default rather than dropped.** A field that only describes the airspace
+  never makes it vanish (a missing airspace would let a check report a false "clear").
+  The item is counted as read with a default and reported:
+  - no usable `_id`: `openaip-item-<n>`, from its position in the file;
+  - no usable `name`: the id;
+  - a missing or invalid `type` (not a whole number from 0 to 999): `OTHER`;
+  - an `icaoClass` that is not an openAIP class code (0 to 6, 8): no class;
+  - an `_id` already used by a different item: the same id with `#2`, `#3`, ...
+- **No class means unclassified.** A missing or null `icaoClass` (optional in the openAIP
+  schema) and code 8 ("Unclassified / Special Use Airspace") give "no ICAO class", so only
+  the airspace type decides whether a clearance is needed. An unknown class code is treated
+  the same way and reported, not guessed: such an airspace may in fact need a clearance.
+- **Unknown type codes are kept** as `TYPE_<n>` (for example `TYPE_37`). Such an airspace is
+  loaded, but no rule in the severity configuration matches it.
+- **Names and ids are cleaned.** They are cut to 256 characters, and control, format,
+  surrogate, private-use, unassigned and line or paragraph separator characters become `?`.
+  The saved file keeps the raw items exactly as downloaded (written as ASCII JSON).
+- **Data files are private** to the user who downloaded them: `take2 fetch-airspace` writes
+  them with file mode 0600 (read and write for the owner only).
+- **Problem reports.** Every skipped or defaulted item is counted; the first 20 are
+  described in the result, and the command line shows the first 5.
 - **Strict JSON.** A file or API page with `NaN`, `Infinity`, a number too large for a
   float, or nesting deeper than Python's JSON parser allows is rejected as a whole.
 - **Open question: unlimited upper limits.** How openAIP writes "UNL" is not verified.
-  Take2 uses the value exactly as published.
+  Take2 uses the value exactly as published (the test data stands in with FL 999 STD).
 - **API behaviour seen on 2026-11-18:** the airspaces endpoint answers HTTP 403 without a
   key and HTTP 404 ("Failed to load user permissions") for a key it does not know, so Take2
   treats a 404 as a probable key problem. A redirect is never followed, so the key is never
   sent to another host.
+- **The API key stays out of every message.** It is sent only in the `x-openaip-api-key`
+  header, never in a URL; error messages are built by Take2 and redacted, and no network
+  exception (which holds the request headers) is attached to them.
 
 ## Input limits
 
@@ -109,7 +128,11 @@ required (a test checks this).
 | Route length | 1,000 NM |
 | Route samples | 100,000 |
 | openAIP file size (`load_openaip_file`) | 100 MB |
+| openAIP items per file | 100,000 (100 pages of 1,000) |
+| openAIP polygon ring | 20,000 positions after closing |
+| openAIP airspace name and id | 256 characters (longer ones are cut) |
 | openAIP download: pages | 100 (1,000 items requested per page) |
+| openAIP download: items per page | 1,000 |
 | openAIP download: one page | 50 MB; compressed responses are refused |
 | openAIP download: all pages together | 100 MB |
 | openAIP download: time for one page | 120 s |
