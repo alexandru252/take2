@@ -5,27 +5,42 @@ fictional, and the API key is a made-up string.
 """
 
 import copy
+import itertools
 import json
+import logging
 import os
 import threading
+import traceback
 import tracemalloc
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import take2
 from take2.io import openaip
 from take2.io.openaip import (
     ICAO_CLASS_BY_CODE,
+    MAX_DOWNLOAD_BYTES,
     MAX_OPENAIP_FILE_SIZE,
+    MAX_PAGE_BYTES,
+    MAX_PAGE_SECONDS,
+    MAX_PAGES,
     MAX_REPORTED_PROBLEMS,
+    PAGE_SIZE,
     REFERENCE_BY_CODE,
+    REQUEST_TIMEOUT,
     TYPE_BY_CODE,
     UNIT_BY_CODE,
+    OpenAipFetchError,
     OpenAipFileError,
     ParseResult,
+    fetch_airspaces,
     load_openaip_file,
+    normalize_country,
     parse_openaip_airspaces,
 )
 from take2.models import Airspace, LimitReference, VerticalLimit
@@ -639,3 +654,495 @@ def test_load_rejects_a_huge_file_without_reading_all_of_it(
         tracemalloc.stop()
 
     assert peak_bytes < 5_000_000
+
+
+# --- fetch_airspaces: the openAIP API through httpx.MockTransport -------------------
+
+FAKE_KEY = "fictional-test-key-0123456789abcdef"  # never a real key
+Handler = Callable[[httpx.Request], httpx.Response]
+
+
+def page_body(items: list[object], page: int, pages: int) -> dict[str, object]:
+    body: dict[str, object] = {
+        "page": page,
+        "limit": PAGE_SIZE,
+        "totalCount": len(items),
+        "totalPages": pages,
+        "items": items,
+    }
+    if page < pages:
+        body["nextPage"] = page + 1
+    return body
+
+
+class FakeOpenAip:
+    """Serves the given pages like the openAIP API and records every request."""
+
+    def __init__(self, *pages: list[object]) -> None:
+        self.pages = pages
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        page = int(request.url.params["page"])
+        return httpx.Response(200, json=page_body(self.pages[page - 1], page, len(self.pages)))
+
+
+def mock_client(handler: Handler) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def fetch_with(handler: Handler, country: str = "RO", api_key: str = FAKE_KEY) -> list[object]:
+    with mock_client(handler) as client:
+        return fetch_airspaces(country, api_key, client=client)
+
+
+def respond(response: httpx.Response) -> Handler:
+    """A handler that answers every request with the same response."""
+    return lambda request: response
+
+
+def raise_error(error: Exception) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    return handler
+
+
+def assert_key_not_shown(exc: BaseException) -> None:
+    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert FAKE_KEY not in shown
+
+
+def test_fetch_requests_pages_until_the_last_one_and_keeps_the_order() -> None:
+    server = FakeOpenAip(
+        [make_item(_id="a"), make_item(_id="b")], [make_item(_id="c")], [make_item(_id="d")]
+    )
+
+    items = fetch_with(server)
+
+    assert [item["_id"] for item in items] == ["a", "b", "c", "d"]  # type: ignore[index]
+    assert [r.url.params["page"] for r in server.requests] == ["1", "2", "3"]
+
+
+def test_fetch_a_single_page_without_next_page() -> None:
+    server = FakeOpenAip([make_item()])
+
+    assert len(fetch_with(server)) == 1
+    assert len(server.requests) == 1
+
+
+def test_fetch_an_empty_country() -> None:
+    assert fetch_with(FakeOpenAip([])) == []
+
+
+def test_fetch_calls_get_airspaces_with_country_page_and_limit() -> None:
+    server = FakeOpenAip([])
+
+    fetch_with(server)
+
+    (request,) = server.requests
+    assert request.method == "GET"
+    assert (request.url.scheme, request.url.host, request.url.path) == (
+        "https",
+        "api.core.openaip.net",
+        "/api/airspaces",
+    )
+    assert dict(request.url.params) == {"country": "RO", "page": "1", "limit": "1000"}
+
+
+def test_fetch_sends_the_key_in_the_header_and_never_in_the_url() -> None:
+    server = FakeOpenAip([make_item(_id="a")], [make_item(_id="b")])
+
+    fetch_with(server)
+
+    for request in server.requests:
+        assert request.headers["x-openaip-api-key"] == FAKE_KEY
+        assert FAKE_KEY not in str(request.url)
+        assert "apiKey" not in request.url.params
+
+
+def test_fetch_identifies_itself_and_asks_for_json() -> None:
+    server = FakeOpenAip([])
+
+    fetch_with(server)
+
+    (request,) = server.requests
+    assert request.headers["user-agent"] == f"take2/{take2.__version__}"
+    assert request.headers["accept"] == "application/json"
+
+
+def test_every_request_has_explicit_timeouts() -> None:
+    server = FakeOpenAip([], [])
+
+    fetch_with(server)
+
+    for request in server.requests:
+        assert request.extensions["timeout"] == {
+            "connect": 10.0,
+            "read": 30.0,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+
+
+def test_request_timeout_values() -> None:
+    timeout = REQUEST_TIMEOUT
+
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (10.0, 30.0, 30.0, 30.0)
+
+
+def test_fetch_without_a_client_uses_its_own_with_timeouts_and_no_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[tuple[httpx.Client, dict[str, object]]] = []
+    real_client = httpx.Client
+
+    def make_client(**kwargs: object) -> httpx.Client:
+        client = real_client(transport=httpx.MockTransport(FakeOpenAip([make_item()])), **kwargs)
+        created.append((client, kwargs))
+        return client
+
+    monkeypatch.setattr(openaip.httpx, "Client", make_client)
+
+    assert len(fetch_airspaces("RO", FAKE_KEY)) == 1
+
+    ((client, kwargs),) = created
+    assert kwargs["timeout"] == REQUEST_TIMEOUT
+    assert kwargs["follow_redirects"] is False
+    assert client.is_closed
+
+
+def test_fetch_leaves_a_callers_client_open() -> None:
+    with mock_client(FakeOpenAip([])) as client:
+        fetch_airspaces("RO", FAKE_KEY, client=client)
+
+        assert not client.is_closed
+
+
+@pytest.mark.parametrize("country", ["ro", "Ro", "RO"])
+def test_fetch_upper_cases_the_country(country: str) -> None:
+    server = FakeOpenAip([])
+
+    fetch_with(server, country=country)
+
+    assert server.requests[0].url.params["country"] == "RO"
+
+
+@pytest.mark.parametrize(
+    "country",
+    ["", "R", "ROU", "R1", "..", "R/", "RÖ", "ＲＯ", " RO", "RO\n", "R\x00"],
+    ids=repr,
+)
+def test_an_invalid_country_is_rejected_before_any_request(country: str) -> None:
+    server = FakeOpenAip([])
+
+    with pytest.raises(ValueError, match="two-letter ISO 3166-1 country code"):
+        fetch_with(server, country=country)
+
+    assert server.requests == []
+
+
+def test_normalize_country() -> None:
+    assert normalize_country("ro") == "RO"
+
+
+def test_an_invalid_country_message_is_short() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        normalize_country("X" * 10_000)
+
+    assert len(str(excinfo.value)) < 150
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    ["", "has space", "line\nbreak", "tab\tkey", "ünïcödé", "k" * 513],
+    ids=["empty", "space", "newline", "tab", "non-ASCII", "too long"],
+)
+def test_an_unusable_api_key_is_rejected_before_any_request(api_key: str) -> None:
+    server = FakeOpenAip([])
+
+    with pytest.raises(ValueError, match="API key") as excinfo:
+        fetch_with(server, api_key=api_key)
+
+    assert server.requests == []
+    if api_key:
+        assert api_key not in str(excinfo.value)
+
+
+def test_an_api_key_of_512_visible_characters_is_accepted() -> None:
+    key = ("".join(chr(code) for code in range(0x21, 0x7F)) * 6)[:512]  # all visible ASCII
+    server = FakeOpenAip([])
+
+    fetch_with(server, api_key=key)
+
+    assert server.requests[0].headers["x-openaip-api-key"] == key
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_api_key_is_reported_with_the_status(status: int) -> None:
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(respond(httpx.Response(status, json={"message": "invalid key"})))
+
+    assert str(excinfo.value) == f"openAIP rejected the API key (HTTP {status})"
+    assert excinfo.value.status_code == status
+    assert_key_not_shown(excinfo.value)
+
+
+@pytest.mark.parametrize("status", [404, 429, 500, 502, 503])
+def test_other_http_errors_are_reported_with_the_status(status: int) -> None:
+    with pytest.raises(OpenAipFetchError, match=f"HTTP {status}") as excinfo:
+        fetch_with(respond(httpx.Response(status, text="<html>error</html>")))
+
+    assert excinfo.value.status_code == status
+
+
+def test_an_http_error_on_a_later_page_fails_the_whole_fetch() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["page"] == "1":
+            return httpx.Response(200, json=page_body([make_item()], 1, 2))
+        return httpx.Response(500)
+
+    with pytest.raises(OpenAipFetchError, match="HTTP 500"):
+        fetch_with(handler)
+
+
+def test_a_redirect_is_not_followed_so_the_key_cannot_leave_openaip() -> None:
+    server_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        server_requests.append(request)
+        return httpx.Response(302, headers={"location": "https://attacker.invalid/steal"})
+
+    with pytest.raises(OpenAipFetchError, match="HTTP 302") as excinfo:
+        fetch_with(handler)
+
+    assert [r.url.host for r in server_requests] == ["api.core.openaip.net"]
+    assert excinfo.value.status_code == 302
+
+
+@pytest.mark.parametrize(
+    ("content", "match"),
+    [
+        (b"<html>maintenance</html>", "not valid JSON"),
+        (b"", "not valid JSON"),
+        (b'{"items": [NaN]}', "not valid JSON"),
+        (b"\xff\xfe{}", "not a UTF-8 text file"),
+        (b"[" * 100_000, "nested too deeply"),
+        (b"[]", "expected a JSON object"),
+        (b'"items"', "expected a JSON object"),
+        (b'{"page": 1}', "no 'items' list"),
+        (b'{"items": {"a": 1}}', "no 'items' list"),
+        (b'{"items": [1, 2]}', "every item must be a JSON object"),
+        (b'{"items": [], "nextPage": 1}', "unexpected nextPage"),
+        (b'{"items": [], "nextPage": 3}', "unexpected nextPage"),
+        (b'{"items": [], "nextPage": "2"}', "unexpected nextPage"),
+        (b'{"items": [], "nextPage": true}', "unexpected nextPage"),
+        (b'{"items": [], "nextPage": false}', "unexpected nextPage"),
+        (b'{"items": [], "nextPage": 0}', "unexpected nextPage"),
+        (b'{"items": [], "nextPage": 2.0}', "unexpected nextPage"),
+    ],
+    ids=[
+        "html",
+        "empty body",
+        "NaN",
+        "UTF-16",
+        "deep nesting",
+        "list",
+        "string",
+        "no items",
+        "items is an object",
+        "items are numbers",
+        "nextPage repeats the page",
+        "nextPage skips a page",
+        "nextPage is a string",
+        "nextPage is true",
+        "nextPage is false",
+        "nextPage is 0",
+        "nextPage is a decimal",
+    ],
+)
+def test_a_malformed_response_is_reported_not_raised_raw(content: bytes, match: str) -> None:
+    with pytest.raises(OpenAipFetchError, match=match) as excinfo:
+        fetch_with(respond(httpx.Response(200, content=content)))
+
+    assert excinfo.value.status_code == 200
+    assert len(str(excinfo.value)) < 200
+
+
+def test_next_page_null_means_the_last_page() -> None:
+    body = {"items": [make_item()], "nextPage": None}
+
+    assert len(fetch_with(respond(httpx.Response(200, json=body)))) == 1
+
+
+def test_download_limits_have_their_documented_values() -> None:
+    assert (MAX_PAGES, PAGE_SIZE, MAX_PAGE_SECONDS) == (100, 1000, 120.0)
+    assert (MAX_PAGE_BYTES, MAX_DOWNLOAD_BYTES) == (50_000_000, 100_000_000)
+    assert MAX_DOWNLOAD_BYTES <= MAX_OPENAIP_FILE_SIZE  # a download can always be read back
+
+
+def test_a_server_that_never_reaches_the_last_page_is_stopped_after_100_pages() -> None:
+    requests: list[httpx.Request] = []
+
+    def endless(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        page = int(request.url.params["page"])
+        return httpx.Response(200, json={"items": [], "nextPage": page + 1})
+
+    with pytest.raises(OpenAipFetchError, match="more than 100 pages"):
+        fetch_with(endless)
+
+    assert len(requests) == MAX_PAGES
+
+
+def test_exactly_100_pages_are_accepted() -> None:
+    server = FakeOpenAip(*([make_item(_id=f"p{page}")] for page in range(1, MAX_PAGES + 1)))
+
+    assert len(fetch_with(server)) == MAX_PAGES
+
+
+def counting_stream(chunk: bytes, chunks: int | None) -> tuple[Iterator[bytes], list[int]]:
+    """A streamed body of ``chunks`` copies of ``chunk`` (endless if None); counts reads."""
+    sent = [0]
+
+    def generate() -> Iterator[bytes]:
+        for _ in itertools.repeat(None) if chunks is None else range(chunks):
+            sent[0] += 1
+            yield chunk
+
+    return generate(), sent
+
+
+def test_a_declared_content_length_over_the_page_limit_is_rejected_before_reading() -> None:
+    body, sent = counting_stream(b"x" * 1000, 10)
+    response = httpx.Response(
+        200, headers={"content-length": str(MAX_PAGE_BYTES + 1)}, content=body
+    )
+
+    with pytest.raises(OpenAipFetchError, match="larger than 50,000,000 bytes"):
+        fetch_with(respond(response))
+
+    assert sent[0] == 0
+
+
+def test_an_endless_streamed_page_is_cut_off_at_the_page_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_PAGE_BYTES", 1_000)
+    body, sent = counting_stream(b"x" * 100, None)  # no content-length, never ends
+
+    with pytest.raises(OpenAipFetchError, match="larger than 1,000 bytes"):
+        fetch_with(respond(httpx.Response(200, content=body)))
+
+    assert sent[0] <= 11
+
+
+@pytest.mark.parametrize(("extra", "accepted"), [(0, True), (1, False)])
+def test_a_page_of_exactly_the_page_limit_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, extra: int, accepted: bool
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_PAGE_BYTES", 5_000)
+    data = json.dumps({"items": [make_item()]}).encode()
+    body, _ = counting_stream(data + b" " * (5_000 - len(data) + extra), 1)
+    handler = respond(httpx.Response(200, content=body))
+
+    if accepted:
+        assert len(fetch_with(handler)) == 1
+    else:
+        with pytest.raises(OpenAipFetchError, match="larger than 5,000 bytes"):
+            fetch_with(handler)
+
+
+def test_all_pages_together_are_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = json.dumps(page_body([make_item()], 1, 2)).encode()
+    monkeypatch.setattr(openaip, "MAX_DOWNLOAD_BYTES", len(page) * 3 // 2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        number = int(request.url.params["page"])
+        return httpx.Response(200, json=page_body([make_item(_id=f"p{number}")], number, 5))
+
+    with pytest.raises(OpenAipFetchError, match="download is larger than"):
+        fetch_with(handler)
+
+
+def test_a_page_that_trickles_in_too_slowly_is_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = itertools.count(start=0.0, step=100.0)  # every clock reading is 100 s later
+    monkeypatch.setattr(openaip, "_clock", lambda: next(ticks))
+    body, sent = counting_stream(b" ", 100)
+
+    with pytest.raises(OpenAipFetchError, match="too slowly"):
+        fetch_with(respond(httpx.Response(200, content=body)))
+
+    assert sent[0] < 100
+
+
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectTimeout("timed out"), httpx.ReadTimeout("timed out"), httpx.PoolTimeout("")],
+    ids=["connect", "read", "pool"],
+)
+def test_a_timeout_is_reported(error: Exception) -> None:
+    with pytest.raises(OpenAipFetchError, match="openAIP did not answer in time") as excinfo:
+        fetch_with(raise_error(error))
+
+    assert excinfo.value.status_code is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("[Errno 8] nodename nor servname provided"),
+        httpx.RemoteProtocolError("peer closed connection"),
+        httpx.DecodingError("incorrect header check"),
+    ],
+    ids=["connect", "protocol", "decoding"],
+)
+def test_a_network_error_is_reported_with_its_kind(error: Exception) -> None:
+    with pytest.raises(OpenAipFetchError, match="cannot reach openAIP") as excinfo:
+        fetch_with(raise_error(error))
+
+    assert type(error).__name__ in str(excinfo.value)
+    assert excinfo.value.status_code is None
+
+
+def test_a_network_error_that_quotes_the_key_is_redacted() -> None:
+    error = httpx.LocalProtocolError(f"Illegal header value b'{FAKE_KEY}'")
+
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(raise_error(error))
+
+    assert "[redacted]" in str(excinfo.value)
+    assert_key_not_shown(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        respond(httpx.Response(401)),
+        respond(httpx.Response(500, text=FAKE_KEY)),
+        respond(httpx.Response(200, content=b"not json " + FAKE_KEY.encode())),
+        raise_error(httpx.ConnectError(f"refused for {FAKE_KEY}")),
+        raise_error(httpx.ReadTimeout(f"slow {FAKE_KEY}")),
+    ],
+    ids=["401", "500 echoing the key", "bad JSON echoing the key", "connect", "timeout"],
+)
+def test_no_failure_shows_the_key_in_its_message_repr_or_traceback(handler: Handler) -> None:
+    with pytest.raises(OpenAipFetchError) as excinfo:
+        fetch_with(handler)
+
+    assert_key_not_shown(excinfo.value)
+    # No chained httpx exception (which holds the request and its headers) is displayed.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None or excinfo.value.__suppress_context__
+
+
+def test_logging_during_a_fetch_never_shows_the_key(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    fetch_with(FakeOpenAip([make_item(_id="a")], [make_item(_id="b")]))
+
+    assert caplog.records  # httpx logs each request, so the check below is not vacuous
+    assert FAKE_KEY not in caplog.text

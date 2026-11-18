@@ -1,12 +1,17 @@
 """openAIP airspace data (SPEC.md section 5, milestone 5).
 
-``parse_openaip_airspaces`` converts openAIP airspace items into ``Airspace`` models, and
-``load_openaip_file`` reads them from a saved JSON file. Both treat the data as untrusted:
-an item that is malformed, uses a code Take2 does not know, or fails model validation is
-skipped and counted instead of failing the whole file, and no JSON value can make them crash.
+``fetch_airspaces`` downloads the raw airspace items of one country from the openAIP API,
+``parse_openaip_airspaces`` converts items into ``Airspace`` models, and
+``load_openaip_file`` reads them from a saved JSON file.
 
-The openAIP codes below come from the official response schema
-(https://api.core.openaip.net/api/schemas/response/airspace/airspace-schema.json).
+All of it treats the data as untrusted. An item that is malformed, uses a code Take2 does
+not know, or fails model validation is skipped and counted instead of failing the whole
+file, and no JSON value can make the conversion crash. A download is bounded in pages,
+bytes and time, and the API key never appears in a URL, an error message or a log line.
+
+The openAIP endpoint and codes come from the official OpenAPI schema
+(https://api.core.openaip.net/api/system/specs/v1/schema.json) and the airspace response
+schema (https://api.core.openaip.net/api/schemas/response/airspace/airspace-schema.json).
 
 Airspace data © openAIP contributors (openaip.net), CC BY-NC 4.0.
 """
@@ -14,21 +19,40 @@ Airspace data © openAIP contributors (openaip.net), CC BY-NC 4.0.
 import json
 import math
 import os
+import re
 import stat
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import httpx
 from pydantic import ValidationError
 
+from take2 import __version__
 from take2.models import Airspace, LimitReference, VerticalLimit
 
-# A whole country is a few MB; the limit leaves room for large countries and future fields.
+ATTRIBUTION = "Airspace data © openAIP contributors (openaip.net), CC BY-NC 4.0"
+OPENAIP_API_URL = "https://api.core.openaip.net/api"
+API_KEY_HEADER = "x-openaip-api-key"
+PAGE_SIZE = 1000  # items requested per page (the openAIP ``limit`` parameter)
+# Bounds for a download, so a broken or hostile server cannot loop or exhaust memory.
+MAX_PAGES = 100
+MAX_PAGE_BYTES = 50_000_000  # one page, after content decoding
+MAX_DOWNLOAD_BYTES = 100_000_000  # all pages together; equal to the file limit below
+MAX_PAGE_SECONDS = 120.0  # wall-clock time for one page, however slowly it trickles in
+REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=10.0)  # seconds per connect, read, write
+MAX_API_KEY_LENGTH = 512
+
+# Generous on purpose (room for large countries); it bounds what a hostile file can cost.
 MAX_OPENAIP_FILE_SIZE = 100_000_000  # bytes
 MAX_REPORTED_PROBLEMS = 20  # skipped items are all counted, but only these are described
 MAX_TYPE_CODE = 999  # openAIP type codes are small; larger numbers are treated as malformed
 _ERROR_PREVIEW_CHARS = 40
+_COUNTRY_RE = re.compile(r"[A-Za-z]{2}")  # used with fullmatch: no trailing newline
+_API_KEY_RE = re.compile(r"[!-~]+")  # visible ASCII: valid in a header, nothing to escape
+_clock = time.monotonic  # replaced in tests
 
 # openAIP airspace type code -> Take2 type string. P, R, D, CTR, TMZ, RMZ, TMA, ATZ and CTA
 # are matched by the severity configuration, so they must keep these exact spellings.
@@ -92,6 +116,14 @@ REFERENCE_BY_CODE: dict[int, LimitReference] = {
 
 class OpenAipFileError(ValueError):
     """A saved openAIP file could not be read, or its content is not openAIP data."""
+
+
+class OpenAipFetchError(RuntimeError):
+    """Downloading from the openAIP API failed (HTTP error, network error, bad response)."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code  # the HTTP status, when the server answered
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +353,168 @@ def _read_openaip_file(path: Path) -> bytes:
             f"openAIP file {name} is too large: more than {MAX_OPENAIP_FILE_SIZE:,} bytes"
         )
     return data
+
+
+def normalize_country(country: str) -> str:
+    """Validate an ISO 3166-1 alpha-2 country code (two ASCII letters); return it upper-cased."""
+    if not _COUNTRY_RE.fullmatch(country):
+        raise ValueError(
+            f"invalid country {_preview(country, 10)!r}: expected a two-letter ISO 3166-1 "
+            "country code such as RO"
+        )
+    return country.upper()
+
+
+def fetch_airspaces(
+    country: str, api_key: str, *, client: httpx.Client | None = None
+) -> list[dict[str, object]]:
+    """Download every airspace item of one country from the openAIP API.
+
+    Requests ``GET /airspaces`` page by page until a page has no ``nextPage``, and returns
+    the raw items in order. The key goes in the ``x-openaip-api-key`` header, never in the
+    URL, and redirects are never followed (httpx would forward that header to any host).
+    Every request uses ``REQUEST_TIMEOUT``, also on a caller's ``client``; a caller's client
+    is left open. A download is bounded by ``MAX_PAGES``, ``MAX_PAGE_BYTES``,
+    ``MAX_DOWNLOAD_BYTES`` and ``MAX_PAGE_SECONDS``.
+
+    Raises ``ValueError`` for an invalid country or an unusable key (before any request) and
+    ``OpenAipFetchError`` when the download fails. No message contains the key.
+    """
+    country = normalize_country(country)
+    _check_api_key(api_key)
+    if client is not None:
+        return _fetch_pages(client, country, api_key)
+    with httpx.Client(timeout=REQUEST_TIMEOUT, follow_redirects=False) as own_client:
+        return _fetch_pages(own_client, country, api_key)
+
+
+def _check_api_key(api_key: str) -> None:
+    """Reject a key that cannot be sent as a header value, without echoing it."""
+    if not api_key:
+        raise ValueError("the openAIP API key is empty")
+    if len(api_key) > MAX_API_KEY_LENGTH:
+        raise ValueError(f"the openAIP API key is longer than {MAX_API_KEY_LENGTH} characters")
+    if not _API_KEY_RE.fullmatch(api_key):
+        raise ValueError(
+            "the openAIP API key contains spaces, control or non-ASCII characters; "
+            "check that it was copied correctly"
+        )
+
+
+def _fetch_pages(client: httpx.Client, country: str, api_key: str) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    downloaded_bytes = 0
+    for page in range(1, MAX_PAGES + 1):
+        data = _download_page(client, country, api_key, page, downloaded_bytes)
+        downloaded_bytes += len(data)
+        page_items, has_next_page = _read_page(data, page)
+        items.extend(page_items)
+        if not has_next_page:
+            return items
+    raise OpenAipFetchError(
+        f"openAIP returned more than {MAX_PAGES} pages; stopped to avoid an endless download"
+    )
+
+
+def _download_page(
+    client: httpx.Client, country: str, api_key: str, page: int, downloaded_bytes: int
+) -> bytes:
+    """One page body, read in a stream and bounded in size and time."""
+    total_left = MAX_DOWNLOAD_BYTES - downloaded_bytes
+    limit_bytes = min(MAX_PAGE_BYTES, total_left)
+    deadline = _clock() + MAX_PAGE_SECONDS
+    try:
+        with client.stream(
+            "GET",
+            f"{OPENAIP_API_URL}/airspaces",
+            params={"country": country, "page": page, "limit": PAGE_SIZE},
+            headers={
+                API_KEY_HEADER: api_key,
+                "Accept": "application/json",
+                "User-Agent": f"take2/{__version__}",
+            },
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=False,
+        ) as response:
+            _check_status(response.status_code)
+            declared = response.headers.get("content-length", "")
+            if declared.isascii() and declared.isdigit() and int(declared) > limit_bytes:
+                raise _too_large(page, limit_bytes, total_left)
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body += chunk
+                if len(body) > limit_bytes:
+                    raise _too_large(page, limit_bytes, total_left)
+                if _clock() > deadline:
+                    raise OpenAipFetchError(
+                        f"openAIP sent page {page} too slowly (more than "
+                        f"{MAX_PAGE_SECONDS:.0f} s); try again later",
+                        status_code=response.status_code,
+                    )
+            return bytes(body)
+    except httpx.TimeoutException:
+        raise OpenAipFetchError("openAIP did not answer in time; try again later") from None
+    except httpx.HTTPError as exc:
+        raise OpenAipFetchError(
+            f"cannot reach openAIP: {_describe_http_error(exc, api_key)}"
+        ) from None
+
+
+def _check_status(status: int) -> None:
+    if status == 200:
+        return
+    if status in (401, 403):
+        raise OpenAipFetchError(f"openAIP rejected the API key (HTTP {status})", status)
+    hint = {429: "too many requests; try again later"}.get(status)
+    if hint is None and status >= 500:
+        hint = "openAIP server error; try again later"
+    message = f"openAIP request failed with HTTP {status}"
+    raise OpenAipFetchError(f"{message} ({hint})" if hint else message, status)
+
+
+def _too_large(page: int, limit_bytes: int, total_left: int) -> OpenAipFetchError:
+    if total_left < MAX_PAGE_BYTES:  # the total, not the page, was the tighter limit
+        message = f"the openAIP download is larger than {MAX_DOWNLOAD_BYTES:,} bytes in total"
+    else:
+        message = f"openAIP page {page} is larger than {limit_bytes:,} bytes"
+    return OpenAipFetchError(message, status_code=200)
+
+
+def _read_page(data: bytes, page: int) -> tuple[list[dict[str, object]], bool]:
+    """The items of one page, and whether another page follows."""
+    try:
+        document = _parse_json(data)
+    except ValueError as exc:
+        raise OpenAipFetchError(f"openAIP page {page} is {exc}", status_code=200) from None
+    if not isinstance(document, dict):
+        raise OpenAipFetchError(
+            f"unexpected openAIP response on page {page}: expected a JSON object", 200
+        )
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise OpenAipFetchError(f"unexpected openAIP response on page {page}: no 'items' list", 200)
+    if not all(isinstance(item, dict) for item in items):
+        raise OpenAipFetchError(
+            f"unexpected openAIP response on page {page}: every item must be a JSON object", 200
+        )
+    next_page = document.get("nextPage")
+    if next_page is None:
+        return items, False
+    # page + 1 >= 2, so booleans (equal to 0 and 1) can never pass this check either.
+    if not isinstance(next_page, int) or next_page != page + 1:
+        raise OpenAipFetchError(
+            f"unexpected openAIP response on page {page}: unexpected nextPage "
+            f"({_json_type(next_page)}, expected {page + 1} or none)",
+            200,
+        )
+    return items, True
+
+
+def _describe_http_error(exc: httpx.HTTPError, api_key: str) -> str:
+    """The error's kind and a short, redacted detail: httpx messages can quote headers."""
+    detail = _preview(str(exc).replace(api_key, "[redacted]"), 80)
+    name = type(exc).__name__
+    return f"{name} ({detail})" if detail else name
 
 
 def _describe_item(item: object) -> str:
