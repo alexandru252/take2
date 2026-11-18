@@ -1,0 +1,85 @@
+{
+  "limit": 1000,
+  "totalCount": 4,
+  "totalPages": 1,
+  "page": 1,
+  "items": [
+    {
+      "_id": "fictional-alpha-ctr",
+      "name": "FICTIONAL ALPHA CTR",
+      "type": 4,
+      "icaoClass": 3,
+      "activity": 0,
+      "onDemand": false,
+      "onRequest": false,
+      "byNotam": false,
+      "specialAgreement": false,
+      "requestCompliance": false,
+      "country": "RO",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[26.0, 44.45], [26.2, 44.45], [26.2, 44.6], [26.0, 44.6]]
+        ]
+      },
+      "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
+      "upperLimit": {"value": 3500, "unit": 1, "referenceDatum": 1},
+      "frequencies": [
+        {"value": "123.450", "unit": 2, "name": "FICTIONAL TOWER", "primary": true}
+      ]
+    },
+    {
+      "_id": "fictional-bravo-tma",
+      "name": "FICTIONAL BRAVO TMA",
+      "type": 7,
+      "icaoClass": 3,
+      "activity": 0,
+      "onDemand": false,
+      "onRequest": false,
+      "byNotam": false,
+      "specialAgreement": false,
+      "requestCompliance": false,
+      "country": "RO",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[25.8, 44.3], [26.4, 44.3], [26.4, 44.8], [25.8, 44.8], [25.8, 44.3]]
+        ]
+      },
+      "lowerLimit": {"value": 65, "unit": 6, "referenceDatum": 2},
+      "upperLimit": {"value": 195, "unit": 6, "referenceDatum": 2}
+    },
+    {
+      "_id": "fictional-charlie-tmz",
+      "name": "FICTIONAL CHARLIE TMZ",
+      "type": 5,
+      "icaoClass": 8,
+      "activity": 0,
+      "onDemand": false,
+      "onRequest": false,
+      "byNotam": false,
+      "specialAgreement": false,
+      "requestCompliance": false,
+      "country": "RO",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[25.5, 44.2], [25.7, 44.2], [25.6, 44.35], [25.5, 44.2]]
+        ]
+      },
+      "lowerLimit": {"value": 300, "unit": 0, "referenceDatum": 0},
+      "upperLimit": {"value": 1500, "unit": 0, "referenceDatum": 1},
+      "transponderSettings": [{"code": "7000", "primary": true}]
+    },
+    {
+      "_id": "fictional-delta-broken",
+      "name": "FICTIONAL DELTA BROKEN",
+      "type": 1,
+      "icaoClass": 8,
+      "country": "RO",
+      "geometry": {"type": "Point", "coordinates": [26.0, 44.0]},
+      "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
+      "upperLimit": {"value": 2000, "unit": 1, "referenceDatum": 1}
+    }
+  ]
+}
