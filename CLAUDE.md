@@ -44,5 +44,8 @@ Before every commit, run the same three checks as CI: `ruff check`, `ruff format
   `geo.LocalProjection` (azimuthal equidistant, centred on the route midpoint).
 - Import errors are domain exceptions that subclass `ValueError` and name the failing line or
   item (see `RouteImportError` in `src/take2/io/routes.py`).
+- Files from users are untrusted. XML goes through `routes._parse_xml` (an expat check with
+  no DTD, bounded depth and element count, then ElementTree on the same text). Do not add
+  parsers that rewrite or re-read input after the check (this is why gpxpy was removed).
 - `SPEC.md` is excluded from `ruff format`, so its snippets stay as written.
 - CI pins `astral-sh/setup-uv` by commit SHA: it publishes no moving major tag such as `v10`.

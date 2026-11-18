@@ -150,7 +150,8 @@ Property tests: `fl_to_altitude_on_qnh_ft` decreases when QNH decreases; at QNH 
 
 ### 7.2 Route import (`io/routes.py`)
 
-- **GPX** (library `gpxpy`): use route points if present, otherwise track points; elevation in metres converted to feet.
+- **GPX** (Python's standard XML parser, after the input checks below; `gpxpy` was dropped because it rewrites its input before parsing, which defeated those checks): use route points if present, otherwise track points; elevation in metres converted to feet.
+- Route files are untrusted input: limit their size, reject any DOCTYPE and limit XML nesting depth and element count before parsing (limits in `docs/LIMITATIONS.md`).
 - **MSFS `.pln`** (XML): read `ATCWaypoint` elements; parse `WorldPosition`, format like `N44° 34' 21.56",E26° 5' 5.06",+004500.00` (degrees, minutes, seconds; altitude in feet).
 - **CSV**: header `name,lat,lon,alt_ft` (`alt_ft` may be empty).
 - If a waypoint has no altitude, use the cruise altitude given by the user.
@@ -243,7 +244,7 @@ take2 scenario run low-qnh-fl-base
 ## 9. Tech stack
 
 - Python 3.12, environment and dependencies with `uv`.
-- `pydantic`, `shapely`, `pyproj`, `gpxpy`, `pyyaml`, `typer`, `streamlit`, `streamlit-folium`, `folium`, `plotly`, `httpx`.
+- `pydantic`, `shapely`, `pyproj`, `pyyaml`, `typer`, `streamlit`, `streamlit-folium`, `folium`, `plotly`, `httpx`.
 - Quality: `pytest`, `hypothesis`, `ruff` (lint and format).
 - GitHub Actions: run `ruff check`, `ruff format --check` and `pytest` on every push and pull request.
 

@@ -39,7 +39,9 @@ questions that are not decided yet.
 
 - Distances along the route are WGS84 geodesics. Lateral distances to airspaces are measured
   in a local azimuthal equidistant projection centred on the point halfway along the route.
-  Tests show sub-metre error 200 km from the centre; accuracy decreases further out.
+  Measured error on a 2 NM lateral distance, across the direction to the centre (the worst
+  case): 0.6 m at 200 km, 3.3 m at 463 km and 13 m at 926 km from the centre, which is the
+  farthest a 1,000 NM route reaches. Routes up to about 500 km (270 NM) stay within 1 m.
 - Airspace edges are straight lines between their published vertices in that projection.
   An edge meant to follow a parallel of latitude or a border over a long distance is only as
   accurate as the vertices that describe it.
@@ -52,7 +54,10 @@ These keep the work bounded when a route file comes from someone else.
 |---|---|
 | Route file size | 10 MB |
 | Waypoints per route | 50,000 |
+| Waypoint name | 256 characters |
 | XML nesting depth (GPX, `.pln`) | 64 elements |
-| XML namespace declarations (GPX, `.pln`) | 32 |
+| XML elements per file (GPX, `.pln`) | 500,000 |
+| XML attributes per element (GPX, `.pln`) | 64 |
+| DOCTYPE / DTD in GPX or `.pln` | not allowed |
 | Route length | 1,000 NM |
 | Route samples | 100,000 |

@@ -15,8 +15,8 @@ you do not keep the "Take 2" safety margin (2 NM laterally, 200 ft vertically).
 
 Take2 reads routes from:
 
-- **GPX**: route points if the file has a route, otherwise track points. Elevations (metres)
-  are converted to feet.
+- **GPX** 1.0 or 1.1: route points if the file has a route, otherwise track points.
+  Elevations (metres) are converted to feet.
 - **MSFS `.pln`**: the `ATCWaypoint` elements of the flight plan.
 - **CSV**: header `name,lat,lon,alt_ft`, decimal degrees, altitude in feet AMSL.
   `alt_ft` may be left empty.
