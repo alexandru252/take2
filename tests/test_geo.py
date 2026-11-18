@@ -3,14 +3,13 @@
 import math
 
 import pytest
-from hypothesis import assume, given
+from hypothesis import assume, example, given
 from hypothesis import strategies as st
 from pyproj import Geod
 
 from take2.geo import (
     M_PER_NM,
     MAX_ROUTE_NM,
-    MAX_ROUTE_SAMPLES,
     LocalProjection,
     densify_route,
     geodesic_distance_m,
@@ -190,6 +189,8 @@ def test_densify_rejects_invalid_step(step_nm: float) -> None:
         max_size=4,
     )
 )
+# Opposite corners of the region, twice: about 1,100 NM, so the over-limit branch always runs.
+@example(points=[(22.0, 43.5), (28.0, 48.0), (22.0, 43.5), (28.0, 48.0)])
 def test_densified_route_property(points: list[tuple[float, float]]) -> None:
     route = make_route(*[(lon, lat, 3000.0) for lon, lat in points])
     legs_nm = sum(
@@ -343,12 +344,16 @@ def test_densified_route_length_matches_reference(
     assert samples[-1].dist_nm == pytest.approx(dist_nm, abs=TOLERANCE_NM)
 
 
-def test_densify_rejects_a_route_longer_than_the_limit() -> None:
-    # 40N to 59N along a meridian is about 1,140 NM.
-    route = make_route((20.0, 40.0, 3000), (20.0, 59.0, 3000))
+@pytest.mark.parametrize(("route_nm", "accepted"), [(990.0, True), (1010.0, False)])
+def test_route_length_limit_is_1000_nm(route_nm: float, accepted: bool) -> None:
+    start = (20.0, 40.0)
+    route = make_route((*start, 3000), (*offset(*start, 0, route_nm * M_PER_NM), 3000))
 
-    with pytest.raises(ValueError, match=f"{MAX_ROUTE_NM:.0f} NM"):
-        densify_route(route)
+    if accepted:
+        assert densify_route(route)[-1].dist_nm == pytest.approx(route_nm, abs=TOLERANCE_NM)
+    else:
+        with pytest.raises(ValueError, match="NM long"):
+            densify_route(route)
 
 
 def test_densify_rejects_a_step_that_would_create_too_many_samples() -> None:
@@ -359,8 +364,23 @@ def test_densify_rejects_a_step_that_would_create_too_many_samples() -> None:
         densify_route(route, step_nm=0.0001)
 
 
-def test_sample_limit_allows_the_longest_route_at_the_default_step() -> None:
-    assert MAX_ROUTE_NM / STEP_NM < MAX_ROUTE_SAMPLES
+def test_densify_rejects_a_vanishingly_small_step_with_a_clear_error() -> None:
+    # 60 NM / 1e-310 overflows to infinity; it used to raise OverflowError from math.ceil.
+    route = make_route((26.0, 44.0, 3000), (26.0, 45.0, 3000))
+
+    with pytest.raises(ValueError, match="samples"):
+        densify_route(route, step_nm=1e-310)
+
+
+def test_dense_track_of_20_000_points_densifies() -> None:
+    # A 1 Hz GPS track: 20,000 points 0.03 NM apart (600 NM), one sample per point.
+    points = [(26.0, 40.0)]
+    for _ in range(19_999):
+        points.append(offset(*points[-1], 0, 0.03 * M_PER_NM))
+
+    samples = densify_route(make_route(*[(lon, lat, 3000.0) for lon, lat in points]))
+
+    assert len(samples) == 20_000
 
 
 def local_point(x_m: float, y_m: float) -> tuple[float, float]:

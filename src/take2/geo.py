@@ -114,7 +114,11 @@ def _measure_leg(start: Waypoint, end: Waypoint, step_nm: float) -> _Leg:
     if leg_m < _MIN_LEG_M:
         return _Leg(start, end, alt_ft, 0.0, 0)
     length_nm = leg_m / M_PER_NM
-    return _Leg(start, end, alt_ft, length_nm, math.ceil(length_nm / step_nm))
+    ratio = length_nm / step_nm
+    # Beyond the sample limit the route is rejected anyway; saturating also avoids
+    # math.ceil(inf), which raises OverflowError for a vanishingly small step.
+    intervals = math.ceil(ratio) if ratio <= MAX_ROUTE_SAMPLES else MAX_ROUTE_SAMPLES + 1
+    return _Leg(start, end, alt_ft, length_nm, intervals)
 
 
 def route_midpoint(route: Route) -> tuple[float, float]:
