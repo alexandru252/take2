@@ -222,5 +222,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Take2: downloaded openAIP data (never committed)
-data/
+# Take2: downloaded openAIP data (never committed), repository root only
+/data/
+
+# Take2: any local environment file with secrets; only the example is committed
+.env.*
+!.env.example
