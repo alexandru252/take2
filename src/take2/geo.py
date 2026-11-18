@@ -10,7 +10,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Self
+from typing import NamedTuple, Self
 
 from pyproj import Geod, Transformer
 from shapely import Point, Polygon
@@ -20,11 +20,25 @@ from take2.models import Route, Waypoint
 M_PER_NM = 1852.0
 DEFAULT_STEP_NM = 0.25
 
+# Limits that keep work bounded for untrusted routes (a 239-byte CSV of near-antipodal legs
+# used to produce 863,121 samples). A 1,000 NM route at the default step is 4,000 samples
+# plus one per leg; the sample limit only stops unreasonably small steps.
+MAX_ROUTE_NM = 1000.0
+MAX_ROUTE_SAMPLES = 100_000
+
 # Legs shorter than this are treated as zero length. The geodesic distance between two
 # identical points can come out as floating-point noise (about 1e-12 m) instead of 0.
 _MIN_LEG_M = 1e-3
 
 _GEOD = Geod(ellps="WGS84")
+
+
+class _Leg(NamedTuple):
+    start: Waypoint
+    end: Waypoint
+    alt_ft: float
+    length_nm: float
+    intervals: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,37 +63,58 @@ def densify_route(route: Route, step_nm: float = DEFAULT_STEP_NM) -> list[RouteS
     Samples are evenly spaced within each leg and every waypoint is a sample. Altitude along
     a leg is the altitude of the leg's start waypoint (v0.1 has no climbs or descents), so
     the final point carries the altitude of the last leg. Zero-length legs add no samples.
+
+    Raises ``ValueError`` for a route longer than ``MAX_ROUTE_NM`` or one that would need
+    more than ``MAX_ROUTE_SAMPLES`` samples, before any sample is created.
     """
-    if not step_nm > 0:
-        raise ValueError(f"step_nm must be positive, got {step_nm}")
+    if not (math.isfinite(step_nm) and step_nm > 0):
+        raise ValueError(f"step_nm must be a positive finite number, got {step_nm}")
+
+    legs = [_measure_leg(start, end, step_nm) for start, end in pairwise(route.waypoints)]
+    route_nm = sum(leg.length_nm for leg in legs)
+    if route_nm > MAX_ROUTE_NM:
+        raise ValueError(
+            f"the route is {route_nm:.0f} NM long; Take2 supports routes up to "
+            f"{MAX_ROUTE_NM:.0f} NM"
+        )
+    sample_count = sum(leg.intervals for leg in legs) + 1
+    if sample_count > MAX_ROUTE_SAMPLES:
+        raise ValueError(
+            f"the route would need {sample_count:,} samples (limit {MAX_ROUTE_SAMPLES:,}); "
+            "use a larger step"
+        )
 
     samples: list[RouteSample] = []
     leg_start_nm = 0.0
-    alt_ft = 0.0
-    for start, end in pairwise(route.waypoints):
-        alt_ft = _leg_altitude_ft(start)
-        leg_m = geodesic_distance_m(start.lon, start.lat, end.lon, end.lat)
-        if leg_m < _MIN_LEG_M:
-            continue
-        leg_nm = leg_m / M_PER_NM
-        intervals = math.ceil(leg_nm / step_nm)
-        if intervals:
-            samples.append(RouteSample(start.lon, start.lat, leg_start_nm, alt_ft))
+    for leg in legs:
+        if leg.intervals:
+            start, end = leg.start, leg.end
+            samples.append(RouteSample(start.lon, start.lat, leg_start_nm, leg.alt_ft))
             # Geod.npts rejects a count of 0, so a leg shorter than one step skips it.
             interior = (
-                _GEOD.npts(start.lon, start.lat, end.lon, end.lat, intervals - 1)
-                if intervals > 1
+                _GEOD.npts(start.lon, start.lat, end.lon, end.lat, leg.intervals - 1)
+                if leg.intervals > 1
                 else []
             )
             samples.extend(
-                RouteSample(lon, lat, leg_start_nm + i * leg_nm / intervals, alt_ft)
+                RouteSample(lon, lat, leg_start_nm + i * leg.length_nm / leg.intervals, leg.alt_ft)
                 for i, (lon, lat) in enumerate(interior, start=1)
             )
-        leg_start_nm += leg_nm
+        leg_start_nm += leg.length_nm
 
     last = route.waypoints[-1]
-    samples.append(RouteSample(last.lon, last.lat, leg_start_nm, alt_ft))
+    samples.append(RouteSample(last.lon, last.lat, leg_start_nm, legs[-1].alt_ft))
     return samples
+
+
+def _measure_leg(start: Waypoint, end: Waypoint, step_nm: float) -> _Leg:
+    """Length and number of sample intervals of one leg (0 for a zero-length leg)."""
+    alt_ft = _leg_altitude_ft(start)
+    leg_m = geodesic_distance_m(start.lon, start.lat, end.lon, end.lat)
+    if leg_m < _MIN_LEG_M:
+        return _Leg(start, end, alt_ft, 0.0, 0)
+    length_nm = leg_m / M_PER_NM
+    return _Leg(start, end, alt_ft, length_nm, math.ceil(length_nm / step_nm))
 
 
 def route_midpoint(route: Route) -> tuple[float, float]:

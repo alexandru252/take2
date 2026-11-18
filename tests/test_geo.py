@@ -3,12 +3,14 @@
 import math
 
 import pytest
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 from pyproj import Geod
 
 from take2.geo import (
     M_PER_NM,
+    MAX_ROUTE_NM,
+    MAX_ROUTE_SAMPLES,
     LocalProjection,
     densify_route,
     geodesic_distance_m,
@@ -170,8 +172,8 @@ def test_densify_requires_an_altitude_on_every_leg_start() -> None:
         densify_route(route)
 
 
-@pytest.mark.parametrize("step_nm", [0.0, -0.25])
-def test_densify_rejects_non_positive_step(step_nm: float) -> None:
+@pytest.mark.parametrize("step_nm", [0.0, -0.25, math.inf, math.nan])
+def test_densify_rejects_invalid_step(step_nm: float) -> None:
     route = make_route((26.0, 44.0, 2000), (26.0, 44.5, 2000))
 
     with pytest.raises(ValueError, match="step"):
@@ -189,13 +191,20 @@ def test_densify_rejects_non_positive_step(step_nm: float) -> None:
     )
 )
 def test_densified_route_property(points: list[tuple[float, float]]) -> None:
-    samples = densify_route(make_route(*[(lon, lat, 3000.0) for lon, lat in points]))
-
-    dists_nm = [s.dist_nm for s in samples]
-    gaps_nm = [b - a for a, b in zip(dists_nm, dists_nm[1:], strict=False)]
+    route = make_route(*[(lon, lat, 3000.0) for lon, lat in points])
     legs_nm = sum(
         geodesic_distance_m(*p, *q) / M_PER_NM for p, q in zip(points, points[1:], strict=False)
     )
+    assume(abs(legs_nm - MAX_ROUTE_NM) > 1e-6)  # avoid rounding right at the limit
+    if legs_nm > MAX_ROUTE_NM:
+        with pytest.raises(ValueError, match="NM long"):
+            densify_route(route)
+        return
+
+    samples = densify_route(route)
+
+    dists_nm = [s.dist_nm for s in samples]
+    gaps_nm = [b - a for a, b in zip(dists_nm, dists_nm[1:], strict=False)]
     assert dists_nm[0] == 0.0
     assert all(0.0 < gap <= STEP_NM + 1e-9 for gap in gaps_nm)
     assert dists_nm[-1] == pytest.approx(legs_nm, abs=1e-6)
@@ -259,12 +268,17 @@ def test_projection_has_east_as_x_and_north_as_y() -> None:
     assert (north_x, north_y) == pytest.approx((0, 5_000), abs=TOLERANCE_M)
 
 
-def test_projection_for_route_is_centred_on_the_route_midpoint() -> None:
-    route = make_route((26.0, 44.0, 3000), (26.0, 45.0, 3000))
+def test_projection_for_route_is_centred_halfway_along_the_legs() -> None:
+    # L-shaped route: 10 km east, then 30 km north. Halfway (20 km) is 10 km north of B,
+    # computed here independently of the production midpoint code.
+    a = (26.0, 44.5)
+    b = offset(*a, 90, 10_000)
+    c = offset(*b, 0, 30_000)
+    expected_centre = offset(*b, 0, 10_000)
 
-    projection = LocalProjection.for_route(route)
+    projection = LocalProjection.for_route(make_route((*a, 3000), (*b, 3000), (*c, 3000)))
 
-    assert (projection.center_lon, projection.center_lat) == pytest.approx(route_midpoint(route))
+    assert projection.to_xy_m(*expected_centre) == pytest.approx((0.0, 0.0), abs=TOLERANCE_M)
 
 
 # --- lateral distance --------------------------------------------------------------
@@ -315,3 +329,84 @@ def test_lateral_distance_outside_a_corner_is_the_distance_to_the_corner(
     assert lateral_distance_nm(polygon, projection.point(*point)) == pytest.approx(
         2.0, abs=TOLERANCE_NM
     )
+
+
+# --- review follow-ups: limits, independent oracles, harder geometry ---------------
+
+
+@pytest.mark.parametrize(("start", "end", "dist_m", "dist_nm"), REFERENCE_DISTANCES)
+def test_densified_route_length_matches_reference(
+    start: tuple[float, float], end: tuple[float, float], dist_m: float, dist_nm: float
+) -> None:
+    samples = densify_route(make_route((*start, 3000), (*end, 3000)))
+
+    assert samples[-1].dist_nm == pytest.approx(dist_nm, abs=TOLERANCE_NM)
+
+
+def test_densify_rejects_a_route_longer_than_the_limit() -> None:
+    # 40N to 59N along a meridian is about 1,140 NM.
+    route = make_route((20.0, 40.0, 3000), (20.0, 59.0, 3000))
+
+    with pytest.raises(ValueError, match=f"{MAX_ROUTE_NM:.0f} NM"):
+        densify_route(route)
+
+
+def test_densify_rejects_a_step_that_would_create_too_many_samples() -> None:
+    # 60 NM at 0.0001 NM would be 600,000 samples.
+    route = make_route((26.0, 44.0, 3000), (26.0, 45.0, 3000))
+
+    with pytest.raises(ValueError, match="samples"):
+        densify_route(route, step_nm=0.0001)
+
+
+def test_sample_limit_allows_the_longest_route_at_the_default_step() -> None:
+    assert MAX_ROUTE_NM / STEP_NM < MAX_ROUTE_SAMPLES
+
+
+def local_point(x_m: float, y_m: float) -> tuple[float, float]:
+    """WGS84 point at (x_m east, y_m north) in the AEQD plane centred on CENTER.
+
+    AEQD keeps azimuth and distance from its centre exact, so this is exact, and polygons
+    built from such points have known planar coordinates in that projection.
+    """
+    return offset(*CENTER, math.degrees(math.atan2(x_m, y_m)), math.hypot(x_m, y_m))
+
+
+def test_lateral_distance_in_a_concave_notch_is_the_distance_to_the_boundary(
+    projection: LocalProjection,
+) -> None:
+    # U-shaped airspace, 20 x 20 km, with an 8 km wide notch open to the north. A point in
+    # the notch is outside, 4 km from both arms. A convex hull would wrongly give 0.
+    ring_xy = [
+        (-10_000, -10_000),
+        (10_000, -10_000),
+        (10_000, 10_000),
+        (4_000, 10_000),
+        (4_000, -5_000),
+        (-4_000, -5_000),
+        (-4_000, 10_000),
+        (-10_000, 10_000),
+        (-10_000, -10_000),
+    ]
+    polygon = projection.polygon([local_point(x, y) for x, y in ring_xy])
+
+    distance_nm = lateral_distance_nm(polygon, projection.point(*local_point(0, 5_000)))
+
+    assert distance_nm == pytest.approx(4_000 / M_PER_NM, abs=TOLERANCE_NM)
+
+
+def test_lateral_distance_is_accurate_200_km_from_the_projection_centre(
+    projection: LocalProjection,
+) -> None:
+    # Edge on the central meridian 200 km north of the centre; the point lies 1.5 NM east of
+    # it, across the radial direction, where AEQD distortion is largest.
+    edge_point = offset(*CENTER, 0, 200_000)
+    _, lat_s = offset(*edge_point, 180, 5_000)
+    _, lat_n = offset(*edge_point, 0, 5_000)
+    lon = edge_point[0]
+    ring = [(lon - 0.1, lat_s), (lon, lat_s), (lon, lat_n), (lon - 0.1, lat_n), (lon - 0.1, lat_s)]
+    point = offset(*edge_point, 90, 1.5 * M_PER_NM)
+
+    distance_nm = lateral_distance_nm(projection.polygon(ring), projection.point(*point))
+
+    assert distance_nm == pytest.approx(1.5, abs=TOLERANCE_NM)

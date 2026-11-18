@@ -101,7 +101,7 @@ def test_std_limit_in_feet_is_a_pressure_altitude() -> None:
 
     alt_ft, approximate = limit_to_altitude_ft(limit, qnh_hpa=993.0)
 
-    assert alt_ft == pytest.approx(fl_to_altitude_on_qnh_ft(65, 993.0))
+    assert alt_ft == pytest.approx(5942.7, abs=TOLERANCE_FT)  # FL65 at QNH 993, SPEC.md 7.1
     assert approximate is False
 
 
