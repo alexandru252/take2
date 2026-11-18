@@ -16,9 +16,7 @@ example an upload) should cap the byte count before decoding, as ``load_route`` 
 
 import csv
 import io
-import os
 import re
-import stat
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
 from collections.abc import Callable, Iterable, Iterator
@@ -27,6 +25,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from take2.altimetry import FT_PER_M
+from take2.io.files import read_text_file
 from take2.models import MAX_ROUTE_WAYPOINTS, Route, Waypoint
 
 # Limits for untrusted route files. Real routes are far smaller: a 1 Hz GPX track of a
@@ -75,42 +74,8 @@ def load_route(path: str | Path, cruise_alt_ft: float) -> Route:
 
 
 def _read_route_file(path: Path) -> str:
-    """Read a regular file of at most ``MAX_ROUTE_FILE_SIZE`` bytes as UTF-8 text.
-
-    The file is opened once and checked through its descriptor, so the path cannot be swapped
-    for a device or FIFO between the check and the read. ``O_NONBLOCK`` keeps ``open`` from
-    blocking on a FIFO, and the read is bounded even if the file grows meanwhile.
-    """
-    name = _preview(path.name)
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
-        fd = os.open(path, flags)
-    except FileNotFoundError as exc:
-        raise RouteImportError(f"route file not found: {name}") from exc
-    except OSError as exc:
-        raise RouteImportError(f"cannot open route file {name}: {exc.strerror}") from exc
-    except ValueError as exc:  # NUL byte or unencodable characters in the path
-        raise RouteImportError(f"invalid route file path: {name!r}") from exc
-    try:
-        # Check the descriptor before fdopen, which itself rejects directories.
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise RouteImportError(f"route file not found or not a regular file: {name}")
-        os.set_blocking(fd, True)  # O_NONBLOCK was only for opening; read normally
-        file = os.fdopen(fd, "rb")
-    except BaseException:
-        os.close(fd)
-        raise
-    with file:
-        try:
-            data = file.read(MAX_ROUTE_FILE_SIZE + 1)
-        except OSError as exc:
-            raise RouteImportError(f"cannot read route file {name}: {exc.strerror}") from exc
-    if len(data) > MAX_ROUTE_FILE_SIZE:
-        raise RouteImportError(f"route file is too large: more than {MAX_ROUTE_FILE_SIZE:,} bytes")
-    try:
-        return data.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise RouteImportError(f"{name} is not a UTF-8 text file") from exc
+    """Read a route file of at most ``MAX_ROUTE_FILE_SIZE`` bytes (see ``read_text_file``)."""
+    return read_text_file(path, MAX_ROUTE_FILE_SIZE, label="route file", error=RouteImportError)
 
 
 def parse_csv(text: str, cruise_alt_ft: float) -> Route:
