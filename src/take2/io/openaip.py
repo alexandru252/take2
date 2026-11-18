@@ -62,10 +62,12 @@ MAX_TYPE_CODE = 999  # openAIP type codes are small; a larger number is read as 
 _ERROR_PREVIEW_CHARS = 40
 _COUNTRY_RE = re.compile(r"[A-Za-z]{2}")  # used with fullmatch: no trailing newline
 _API_KEY_RE = re.compile(r"[!-~]+")  # visible ASCII: valid in a header, nothing to escape
-# One .env assignment: optional "export", a variable name, "=", the rest of the line.
-_ENV_LINE_RE = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*")
-# Starts a comment in an unquoted value: "#" at its start or after whitespace ("a#b" is a value).
-_ENV_COMMENT_RE = re.compile(r"(?:^|\s+)#")
+# One .env assignment: optional "export", a variable name, "=", the rest of the line. The
+# value is stripped in code: a regex that trims it would backtrack over whitespace runs.
+_ENV_LINE_RE = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)")
+# A comment in an unquoted value starts at a "#" after one whitespace character ("a#b" is a
+# value). One character, not \s+: a run of spaces without "#" must not be rescanned.
+_ENV_COMMENT_RE = re.compile(r"\s#")
 _clock = time.monotonic  # replaced in tests
 # Unicode categories replaced by "?" in names and ids: control, format, surrogate,
 # private use, unassigned, line separator, paragraph separator.
@@ -307,11 +309,10 @@ def read_api_key(env_file: Path = Path(".env")) -> str | None:
     from_environment = os.environ.get(API_KEY_ENV_VAR, "").strip()
     if from_environment:
         return from_environment
-    if not env_file.is_file():  # also keeps a FIFO from blocking the read below
+    data = _read_regular_file(env_file, MAX_ENV_FILE_SIZE)
+    if data is None:  # no file, or not a regular one (a directory, a FIFO)
         return None
     name = _preview(env_file.name)
-    with env_file.open("rb") as file:
-        data = file.read(MAX_ENV_FILE_SIZE + 1)
     if len(data) > MAX_ENV_FILE_SIZE:
         raise ValueError(f"{name} is larger than {MAX_ENV_FILE_SIZE:,} bytes")
     try:
@@ -319,21 +320,25 @@ def read_api_key(env_file: Path = Path(".env")) -> str | None:
     except UnicodeDecodeError:
         raise ValueError(f"{name} is not a UTF-8 text file") from None
     value: str | None = None
-    for line in text.splitlines():
-        match = _ENV_LINE_RE.fullmatch(line)
+    # Only "\n" ends a line, as in a shell; splitlines() would also split on \v, \x85, ...
+    for line in text.split("\n"):
+        match = _ENV_LINE_RE.fullmatch(line.removesuffix("\r"))
         if match is not None and match.group(1) == API_KEY_ENV_VAR:
-            value = _env_value(match.group(2), name)
+            value = _env_value(match.group(2).strip(), name)
     return value or None
 
 
 def _env_value(raw: str, file_name: str) -> str:
-    """The value part of a ``.env`` line: unquoted, without a trailing comment."""
+    """The value part of a ``.env`` line (already stripped): unquoted, without a comment."""
     if raw[:1] in ('"', "'"):
         end = raw.find(raw[0], 1)
         if end == -1:
             raise ValueError(f"{API_KEY_ENV_VAR} in {file_name} has no closing quote")
         return raw[1:end]
-    return _ENV_COMMENT_RE.split(raw, maxsplit=1)[0].strip()
+    if raw.startswith("#"):
+        return ""
+    comment = _ENV_COMMENT_RE.search(raw)
+    return (raw[: comment.start()] if comment else raw).strip()
 
 
 def _parse_json(data: bytes) -> object:
@@ -520,35 +525,41 @@ def _polygon_ring(geometry: object) -> list[tuple[float, float]]:
     return ring
 
 
-def _read_openaip_file(path: Path) -> bytes:
-    """Read a regular file of at most ``MAX_OPENAIP_FILE_SIZE`` bytes.
+def _read_regular_file(path: Path, limit_bytes: int) -> bytes | None:
+    """At most ``limit_bytes + 1`` bytes of ``path``; None if it is missing or not a file.
 
     Same approach as the route reader: open once with ``O_NONBLOCK`` (a FIFO cannot block
-    the open), check the descriptor is a regular file, then read a bounded number of bytes.
+    the open), check through the descriptor that it is a regular file (so the path cannot
+    be swapped between a check and the read), then read a bounded number of bytes. Raises
+    ``OSError`` if the file cannot be opened or read, ``ValueError`` for an invalid path.
     """
-    name = _preview(path.name)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
         fd = os.open(path, flags)
-    except FileNotFoundError:
-        raise OpenAipFileError(f"openAIP file not found: {name}") from None
-    except OSError as exc:
-        raise OpenAipFileError(f"cannot open openAIP file {name}: {exc.strerror}") from None
-    except ValueError:  # NUL byte or unencodable characters in the path
-        raise OpenAipFileError(f"invalid openAIP file path: {name!r}") from None
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OpenAipFileError(f"openAIP file not found or not a regular file: {name}")
+            return None
         os.set_blocking(fd, True)  # O_NONBLOCK was only for opening; read normally
-        file = os.fdopen(fd, "rb")
-    except BaseException:
+        with os.fdopen(fd, "rb", closefd=False) as file:
+            return file.read(limit_bytes + 1)
+    finally:
         os.close(fd)
-        raise
-    with file:
-        try:
-            data = file.read(MAX_OPENAIP_FILE_SIZE + 1)
-        except OSError as exc:
-            raise OpenAipFileError(f"cannot read openAIP file {name}: {exc.strerror}") from None
+
+
+def _read_openaip_file(path: Path) -> bytes:
+    """Read a regular file of at most ``MAX_OPENAIP_FILE_SIZE`` bytes."""
+    name = _preview(path.name)
+    try:
+        data = _read_regular_file(path, MAX_OPENAIP_FILE_SIZE)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise OpenAipFileError(f"cannot read openAIP file {name}: {reason}") from None
+    except ValueError:  # NUL byte or unencodable characters in the path
+        raise OpenAipFileError(f"invalid openAIP file path: {name!r}") from None
+    if data is None:
+        raise OpenAipFileError(f"openAIP file not found or not a regular file: {name}")
     if len(data) > MAX_OPENAIP_FILE_SIZE:
         raise OpenAipFileError(
             f"openAIP file {name} is too large: more than {MAX_OPENAIP_FILE_SIZE:,} bytes"

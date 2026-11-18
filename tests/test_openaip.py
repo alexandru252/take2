@@ -940,7 +940,7 @@ def test_load_rejects_an_unreadable_file(tmp_path: Path) -> None:
     path = write_json(tmp_path / "locked.json", [make_item()])
     path.chmod(0)
     try:
-        with pytest.raises(OpenAipFileError, match="cannot open openAIP file locked.json"):
+        with pytest.raises(OpenAipFileError, match="cannot read openAIP file locked.json"):
             load_openaip_file(path)
     finally:
         path.chmod(0o600)
@@ -1811,6 +1811,7 @@ ENV_FILES = {
     "double quotes": ('OPENAIP_API_KEY="abc123"\n', "abc123"),
     "single quotes": ("OPENAIP_API_KEY='abc123'\n", "abc123"),
     "quotes keep inner spaces": ('OPENAIP_API_KEY=" abc 123 "\n', " abc 123 "),
+    "quotes after spaces around =": ('OPENAIP_API_KEY = "abc123"  \n', "abc123"),
     "comment after the value": ("OPENAIP_API_KEY=abc123 # my key\n", "abc123"),
     "comment after quotes": ('OPENAIP_API_KEY="abc#123"   # my key\n', "abc#123"),
     "hash inside a value": ("OPENAIP_API_KEY=abc#123\n", "abc#123"),
@@ -1835,6 +1836,95 @@ ENV_FILES = {
 @pytest.mark.parametrize(("text", "expected"), ENV_FILES.values(), ids=ENV_FILES.keys())
 def test_env_file_lines(tmp_path: Path, text: str, expected: str | None) -> None:
     assert read_api_key(env_file(tmp_path, text)) == expected
+
+
+LONG_WHITESPACE_LINES = {
+    "spaces inside the value": ("OPENAIP_API_KEY=a" + " " * 50_000 + "b", "a" + " " * 50_000 + "b"),
+    "spaces after the value": ("OPENAIP_API_KEY=a" + " " * 50_000, "a"),
+    "spaces before the value": ("OPENAIP_API_KEY=" + " " * 50_000 + "x", "x"),
+    "spaces after the name, no =": ("OPENAIP_API_KEY" + " " * 50_000 + "x", None),
+    "export then spaces": ("export" + " " * 50_000 + "x", None),
+}
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize(
+    ("line", "expected"), LONG_WHITESPACE_LINES.values(), ids=LONG_WHITESPACE_LINES.keys()
+)
+def test_long_whitespace_runs_in_env_file_lines_are_parsed_in_linear_time(
+    tmp_path: Path, line: str, expected: str | None
+) -> None:
+    path = env_file(tmp_path, line + "\n")
+
+    started = time.perf_counter()
+    value = read_api_key(path)
+
+    assert value == expected
+    assert time.perf_counter() - started < 1.0  # a backtracking regex takes ~10 s here
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize(
+    "separator",
+    [0x0D, 0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029],
+    ids=["CR alone", "VT", "FF", "FS", "GS", "RS", "NEL", "LS", "PS"],
+)
+def test_only_a_newline_ends_an_env_file_line(tmp_path: Path, separator: int) -> None:
+    # str.splitlines() would also break here, turning part of A's value into a new line.
+    path = env_file(tmp_path, f"A=1{chr(separator)}OPENAIP_API_KEY=abc\n")
+
+    assert read_api_key(path) is None
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_a_carriage_return_before_the_newline_is_not_part_of_the_value(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_bytes(b"OPENAIP_API_KEY='abc'\r\nB=2\r\n")
+
+    assert read_api_key(path) == "abc"
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize("target", ["missing", "directory"])
+def test_an_env_symlink_to_nothing_or_a_directory_is_ignored(tmp_path: Path, target: str) -> None:
+    pointed = tmp_path / "target"
+    if target == "directory":
+        pointed.mkdir()
+    link = tmp_path / ".env"
+    link.symlink_to(pointed)
+
+    assert read_api_key(link) is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read files without permission")
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_an_unreadable_env_file_raises_os_error(tmp_path: Path) -> None:
+    path = env_file(tmp_path, "OPENAIP_API_KEY=abc\n")
+    path.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            read_api_key(path)
+    finally:
+        path.chmod(0o600)
+
+
+def open_fd_count() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize("make", ["directory", "fifo"])
+def test_rejecting_a_non_regular_path_closes_the_descriptor(tmp_path: Path, make: str) -> None:
+    path = tmp_path / "not-a-file"
+    path.mkdir() if make == "directory" else os.mkfifo(path)
+    before = open_fd_count()
+
+    for _ in range(50):
+        assert read_api_key(path) is None
+        with pytest.raises(OpenAipFileError):
+            load_openaip_file(path)
+
+    assert open_fd_count() == before
 
 
 @pytest.mark.usefixtures("no_key_in_environment")
