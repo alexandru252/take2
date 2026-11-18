@@ -7,7 +7,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Take2 contributors" }]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2.7",
+]
 
 [dependency-groups]
 dev = [
