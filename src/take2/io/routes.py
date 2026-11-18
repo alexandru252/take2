@@ -37,8 +37,15 @@ _ERROR_PREVIEW_CHARS = 40
 # (name or None, lat, lon, alt_ft or None) as read from a file, before validation.
 type RawPoint = tuple[str | None, float, float, float | None]
 
+# re.ASCII: \d must not match other scripts' digits, which float() would silently accept.
 _DMS_RE = re.compile(
-    r"""^\s*([NSEW])\s*(\d+(?:\.\d+)?)\s*°\s*(\d+(?:\.\d+)?)\s*'\s*(\d+(?:\.\d+)?)\s*"\s*$"""
+    r"""^\s*([NSEW])\s*(\d+(?:\.\d+)?)\s*°\s*(\d+(?:\.\d+)?)\s*'\s*(\d+(?:\.\d+)?)\s*"\s*$""",
+    re.ASCII,
+)
+# A plain decimal number. float() also accepts "4_4.5", "nan", "inf" and non-ASCII digits.
+_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
+_GPX_NAMESPACES = frozenset(
+    {"http://www.topografix.com/GPX/1/1", "http://www.topografix.com/GPX/1/0", ""}
 )
 
 
@@ -71,6 +78,8 @@ def _read_route_file(path: Path) -> str:
         raise RouteImportError(f"route file not found: {name}") from exc
     except OSError as exc:
         raise RouteImportError(f"cannot open route file {name}: {exc.strerror}") from exc
+    except ValueError as exc:  # NUL byte or unencodable characters in the path
+        raise RouteImportError(f"invalid route file path: {name!r}") from exc
     try:
         # Check the descriptor before fdopen, which itself rejects directories.
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -144,6 +153,10 @@ def parse_gpx(text: str, cruise_alt_ft: float) -> Route:
         raise RouteImportError(
             f"not a GPX file: the root element is {_preview(root_name)!r}, expected gpx"
         )
+    if namespace not in _GPX_NAMESPACES:
+        raise RouteImportError(
+            f"not a GPX 1.0 or 1.1 file: unknown namespace {_preview(namespace)!r}"
+        )
 
     def tag(name: str) -> str:
         return f"{{{namespace}}}{name}" if namespace else name
@@ -156,6 +169,13 @@ def parse_gpx(text: str, cruise_alt_ft: float) -> Route:
             for seg in trk.findall(tag("trkseg"))
             for pt in seg.findall(tag("trkpt"))
         ]
+    if not points:
+        raise RouteImportError(
+            "the GPX file has no route or track points (rte/rtept or trk/trkseg/trkpt; "
+            "wpt waypoints are not read): a route needs at least 2 waypoints"
+        )
+    if len(points) > MAX_ROUTE_WAYPOINTS:
+        raise _too_many_waypoints(len(points))
     raw: list[RawPoint] = []
     for index, point in enumerate(points, start=1):
         ele_text = (point.findtext(tag("ele")) or "").strip()
@@ -175,8 +195,11 @@ def parse_pln(text: str, cruise_alt_ft: float) -> Route:
     _check_size(text)
     root = _parse_xml(text, "PLN")
 
+    elements = list(root.iter("ATCWaypoint"))
+    if len(elements) > MAX_ROUTE_WAYPOINTS:
+        raise _too_many_waypoints(len(elements))
     raw: list[RawPoint] = []
-    for index, element in enumerate(root.iter("ATCWaypoint"), start=1):
+    for index, element in enumerate(elements, start=1):
         position = element.findtext("WorldPosition")
         if position is None:
             raise RouteImportError(f"ATCWaypoint {index}: missing WorldPosition")
@@ -202,7 +225,7 @@ def parse_world_position(text: str) -> tuple[float, float, float | None]:
     alt_ft = None
     if len(parts) == 3 and parts[2]:
         try:
-            alt_ft = float(parts[2])
+            alt_ft = _parse_number(parts[2])
         except ValueError as exc:
             raise RouteImportError(
                 f"invalid WorldPosition altitude {_preview(parts[2])!r}"
@@ -238,9 +261,17 @@ def _csv_records(text: str) -> Iterator[tuple[int, list[str]]]:
         yield reader.line_num, fields
 
 
+def _parse_number(text: str) -> float:
+    """Parse a plain decimal number such as ``-44.5`` or ``4.45e1``; raise ValueError otherwise."""
+    text = text.strip()
+    if not _NUMBER_RE.fullmatch(text):
+        raise ValueError(f"not a plain decimal number: {text!r}")
+    return float(text)
+
+
 def _csv_float(text: str, column: str, line: int) -> float:
     try:
-        return float(text)
+        return _parse_number(text)
     except ValueError as exc:
         raise RouteImportError(
             f"CSV line {line}: {column} {_preview(text)!r} is not a number"
@@ -251,7 +282,7 @@ def _gpx_float(text: str | None, field: str, index: int) -> float:
     if text is None:
         raise RouteImportError(f"GPX point {index}: missing {field}")
     try:
-        return float(text)
+        return _parse_number(text)
     except ValueError as exc:
         raise RouteImportError(
             f"GPX point {index}: {field} {_preview(text)!r} is not a number"
@@ -319,7 +350,9 @@ def _parse_xml(text: str, file_type: str) -> ET.Element:
     _check_xml(text, file_type)
     try:
         return ET.fromstring(text)
-    except ET.ParseError as exc:  # not expected after _check_xml, kept as a safety net
+    # Reachable: _check_xml does not process namespaces, so an undeclared prefix or an
+    # attribute duplicated through two prefixes only fails here. Keep this handler.
+    except ET.ParseError as exc:
         raise RouteImportError(f"invalid {file_type} file (XML error): {exc}") from exc
 
 

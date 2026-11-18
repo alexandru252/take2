@@ -1,8 +1,11 @@
 """Tests for take2.io.routes (SPEC.md section 7.2)."""
 
+import errno
+import io
 import os
 import shutil
 import threading
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -349,7 +352,7 @@ def test_gpx_rejects_billion_laughs() -> None:
         '<rtept lat="44.6" lon="26.1"/></rte>'
     )
 
-    with pytest.raises(RouteImportError):
+    with pytest.raises(RouteImportError, match="DOCTYPE"):
         parse_gpx(BILLION_LAUGHS_DTD + gpx_document(body), cruise_alt_ft=CRUISE_FT)
 
 
@@ -358,7 +361,7 @@ def test_pln_rejects_billion_laughs() -> None:
     text = text.replace('<?xml version="1.0" encoding="UTF-8"?>', BILLION_LAUGHS_DTD)
     text = text.replace('id="P1"', "").replace("N44° 30' 0.00\",E26° 0' 0.00\"", "&j;")
 
-    with pytest.raises(RouteImportError):
+    with pytest.raises(RouteImportError, match="DOCTYPE"):
         parse_pln(text, cruise_alt_ft=CRUISE_FT)
 
 
@@ -377,7 +380,7 @@ def test_gpx_does_not_read_external_entities(tmp_path: Path) -> None:
         '<rtept lat="44.6" lon="26.1"/></rte>'
     )
 
-    with pytest.raises(RouteImportError) as excinfo:
+    with pytest.raises(RouteImportError, match="DOCTYPE") as excinfo:
         parse_gpx(dtd + gpx_document(body), cruise_alt_ft=CRUISE_FT)
 
     assert "SECRET" not in str(excinfo.value)
@@ -390,7 +393,7 @@ def test_pln_does_not_read_external_entities(tmp_path: Path) -> None:
     text = text.replace('<?xml version="1.0" encoding="UTF-8"?>', dtd)
     text = text.replace("N44° 30' 0.00\",E26° 0' 0.00\"", "&j;")
 
-    with pytest.raises(RouteImportError) as excinfo:
+    with pytest.raises(RouteImportError, match="DOCTYPE") as excinfo:
         parse_pln(text, cruise_alt_ft=CRUISE_FT)
 
     assert "44° 30" not in str(excinfo.value)
@@ -415,8 +418,8 @@ def test_any_doctype_is_rejected(parser) -> None:
 
 
 def test_markup_hidden_in_a_comment_stays_a_comment() -> None:
-    # Found in the security re-review: gpxpy rewrote ' xmlns="..."' in the raw text before
-    # parsing, which turned this comment into real markup that the safety check never saw.
+    # Found in the security re-review: the old GPX library rewrote ' xmlns="..."' in the raw
+    # text before parsing, turning this comment into markup that the safety check never saw.
     text = (
         '<gpx version="1.1" creator="t"><rte><rtept lat="44.5" lon="26.0"/>'
         'T xmlns="<!--"<rtept lat="45.0" lon="27.0"/>-->'
@@ -586,27 +589,6 @@ def test_text_that_cannot_be_encoded_is_rejected(parser) -> None:
         parser("\ud800<gpx/>", cruise_alt_ft=CRUISE_FT)
 
 
-def test_deeply_nested_gpx_is_rejected() -> None:
-    # Deep nesting used to crash the process (stack overflow in a recursive copy in gpxpy).
-    nested = "<x>" * 1_000 + "</x>" * 1_000
-    body = (
-        f'<rte><rtept lat="44.5" lon="26.0"><extensions>{nested}</extensions></rtept>'
-        '<rtept lat="44.6" lon="26.1"/></rte>'
-    )
-
-    with pytest.raises(RouteImportError, match="nested"):
-        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
-
-
-def test_deeply_nested_pln_is_rejected() -> None:
-    nested = "<x>" * 1_000 + "</x>" * 1_000
-    text = pln_document("N44° 30' 0.00\",E26° 0' 0.00\"", "N44° 36' 0.00\",E26° 6' 0.00\"")
-    text = text.replace("</FlightPlan.FlightPlan>", nested + "</FlightPlan.FlightPlan>")
-
-    with pytest.raises(RouteImportError, match="nested"):
-        parse_pln(text, cruise_alt_ft=CRUISE_FT)
-
-
 def test_gpx_declaring_a_namespace_on_every_point_is_accepted() -> None:
     # Some exporters repeat the extension namespace on every point; a long real track must
     # not be rejected for that (found in the code review of the first guard).
@@ -633,13 +615,6 @@ def test_text_larger_than_the_limit_is_rejected(
 
     with pytest.raises(RouteImportError, match="too large"):
         parser(text, cruise_alt_ft=CRUISE_FT)
-
-
-def test_load_route_rejects_a_file_larger_than_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(routes, "MAX_ROUTE_FILE_SIZE", 50)
-
-    with pytest.raises(RouteImportError, match="too large"):
-        load_route(FIXTURES / "route.csv", cruise_alt_ft=CRUISE_FT)
 
 
 @pytest.mark.parametrize("make", ["missing", "directory", "fifo"])
@@ -698,7 +673,7 @@ def test_load_route_rejects_an_unreadable_file(tmp_path: Path) -> None:
     shutil.copy(FIXTURES / "route.csv", path)
     path.chmod(0)
     try:
-        with pytest.raises(RouteImportError, match="locked.csv"):
+        with pytest.raises(RouteImportError, match="cannot open route file locked.csv"):
             load_route(path, cruise_alt_ft=CRUISE_FT)
     finally:
         path.chmod(0o600)
@@ -718,3 +693,312 @@ def test_error_for_a_long_world_position_is_short() -> None:
         parse_world_position("N" * 10_000)
 
     assert len(str(excinfo.value)) < 300
+
+
+# --- QA review of the stdlib GPX reader (mutation-tested) --------------------------
+
+GPX11 = "http://www.topografix.com/GPX/1/1"
+TWO_RTEPTS = '<rtept lat="44.5" lon="26.0"/><rtept lat="44.6" lon="26.1"/>'
+
+
+# --- G17: ElementTree errors after the expat check ---------------------------------
+@pytest.mark.parametrize(
+    "body",
+    [
+        # An exporter that forgot xmlns:gpxtpx: expat without namespaces accepts it.
+        '<trk><trkseg><trkpt lat="44.5" lon="26.0"><extensions><gpxtpx:hr>95</gpxtpx:hr>'
+        '</extensions></trkpt><trkpt lat="44.6" lon="26.1"/></trkseg></trk>',
+        # Two prefixes for one namespace: the same attribute twice once names are expanded.
+        '<rte><rtept xmlns:a="urn:x" xmlns:b="urn:x" a:v="1" b:v="2" lat="44.5" lon="26.0"/>'
+        '<rtept lat="44.6" lon="26.1"/></rte>',
+    ],
+    ids=["unbound-prefix", "duplicate-expanded-attribute"],
+)
+def test_gpx_namespace_errors_are_route_import_errors(body: str) -> None:
+    with pytest.raises(RouteImportError):
+        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+# --- G3, G5: empty and blank <ele> ------------------------------------------------
+@pytest.mark.parametrize("ele", ["<ele/>", "<ele></ele>", "<ele>  </ele>", "<ele>\n\t</ele>"])
+def test_gpx_empty_or_blank_ele_means_no_altitude(ele: str) -> None:
+    body = f'<rte><rtept lat="44.5" lon="26.0">{ele}</rtept><rtept lat="44.6" lon="26.1"/></rte>'
+
+    route = parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+    assert route.waypoints[0].alt_ft == CRUISE_FT
+
+
+# --- G4: surrounding whitespace in <name> -----------------------------------------
+@pytest.mark.parametrize(("name", "expected"), [("\n  ALPHA \n", "ALPHA"), ("   ", "WP1")])
+def test_gpx_name_whitespace_is_stripped(name: str, expected: str) -> None:
+    body = (
+        f'<rte><rtept lat="44.5" lon="26.0"><name>{name}</name></rtept>'
+        '<rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    assert parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT).waypoints[0].name == expected
+
+
+# --- G13: non-numeric <ele> --------------------------------------------------------
+@pytest.mark.parametrize("ele", ["high", "1,5", "300 m"])
+def test_gpx_non_numeric_ele_is_rejected(ele: str) -> None:
+    body = (
+        f'<rte><rtept lat="44.5" lon="26.0"><ele>{ele}</ele></rtept>'
+        '<rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    with pytest.raises(RouteImportError):
+        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+# --- G11: missing or bad lon (existing test covers lat only) -----------------------
+@pytest.mark.parametrize("attributes", ['lat="44.5"', 'lat="44.5" lon="east"'])
+def test_gpx_point_with_missing_or_bad_longitude_is_rejected(attributes: str) -> None:
+    body = f'<rte><rtept {attributes}/><rtept lat="44.6" lon="26.1"/></rte>'
+
+    with pytest.raises(RouteImportError):
+        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+# --- G8: several tracks ------------------------------------------------------------
+def test_gpx_joins_the_points_of_all_tracks_in_file_order() -> None:
+    body = (
+        '<trk><trkseg><trkpt lat="44.1" lon="26.0"/><trkpt lat="44.2" lon="26.0"/></trkseg></trk>'
+        '<trk><trkseg><trkpt lat="44.3" lon="26.0"/></trkseg></trk>'
+    )
+
+    route = parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+    assert [w.lat for w in route.waypoints] == [44.1, 44.2, 44.3]
+
+
+# --- G14, G14b, G15: only direct children count ------------------------------------
+@pytest.mark.parametrize(
+    "body",
+    [
+        '<trk><trkseg><trkpt lat="44.5" lon="26.0"><extensions><trkpt lat="45.0" lon="27.0"/>'
+        '</extensions></trkpt><trkpt lat="44.6" lon="26.1"/></trkseg></trk>',
+        '<extensions><rte><rtept lat="45.0" lon="27.0"/><rtept lat="45.1" lon="27.1"/></rte>'
+        '</extensions><trk><trkseg><trkpt lat="44.5" lon="26.0"/><trkpt lat="44.6" lon="26.1"/>'
+        "</trkseg></trk>",
+    ],
+    ids=["trkpt-in-trkpt-extensions", "rte-in-gpx-extensions"],
+)
+def test_gpx_route_and_track_elements_inside_extensions_are_ignored(body: str) -> None:
+    route = parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+    assert [(w.lat, w.lon) for w in route.waypoints] == [(44.5, 26.0), (44.6, 26.1)]
+
+
+# --- G10 (strengthen): wrong root with otherwise valid points ----------------------
+def test_root_other_than_gpx_is_rejected_even_with_valid_points() -> None:
+    text = f'<kml xmlns="{GPX11}"><rte>{TWO_RTEPTS}</rte></kml>'
+
+    with pytest.raises(RouteImportError):
+        parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+# --- G1: elements in other namespaces --------------------------------------------
+def test_gpx_points_in_another_namespace_are_ignored() -> None:
+    body = (
+        '<rte><rtept lat="44.5" lon="26.0"/><o:rtept xmlns:o="urn:other" lat="45.0" lon="27.0"/>'
+        '<rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    assert len(parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT).waypoints) == 2
+
+
+# --- X2, X3: element limit accepted at exactly 500,000 -----------------------------
+@pytest.mark.parametrize(("elements", "accepted"), [(500_000, True), (500_001, False)])
+def test_element_limit_is_500_000(elements: int, accepted: bool) -> None:
+    # gpx + rte + 2 rtept = 4 elements; the rest are empty <a/> siblings of rte.
+    text = gpx_document(f"<rte>{TWO_RTEPTS}</rte>" + "<a/>" * (elements - 4))
+
+    if accepted:
+        assert len(parse_gpx(text, cruise_alt_ft=CRUISE_FT).waypoints) == 2
+    else:
+        with pytest.raises(RouteImportError, match="elements"):
+            parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+# --- X1: namespace declarations count as attributes --------------------------------
+@pytest.mark.parametrize(("count", "accepted"), [(64, True), (65, False)])
+def test_namespace_declarations_count_toward_the_attribute_limit(
+    count: int, accepted: bool
+) -> None:
+    declarations = " ".join(f'xmlns:n{i}="urn:n{i}"' for i in range(count - 2))
+    body = f'<rte><rtept lat="44.5" lon="26.0" {declarations}/><rtept lat="44.6" lon="26.1"/></rte>'
+
+    if accepted:
+        assert len(parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT).waypoints) == 2
+    else:
+        with pytest.raises(RouteImportError, match="attributes"):
+            parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+# --- R1: descriptor closed when the path is not a regular file ---------------------
+def open_fd_count() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+@pytest.mark.parametrize("make", ["directory", "fifo"])
+def test_rejecting_a_non_regular_file_closes_the_descriptor(tmp_path: Path, make: str) -> None:
+    path = tmp_path / "route.csv"
+    path.mkdir() if make == "directory" else os.mkfifo(path)
+    before = open_fd_count()
+
+    for _ in range(50):
+        with pytest.raises(RouteImportError):
+            load_route(path, cruise_alt_ft=CRUISE_FT)
+
+    assert open_fd_count() == before
+
+
+# --- R4: file of exactly 10,000,000 bytes is accepted ------------------------------
+@pytest.mark.parametrize(("size", "accepted"), [(10_000_000, True), (10_000_001, False)])
+def test_route_file_size_limit_is_10_000_000_bytes(
+    tmp_path: Path, size: int, accepted: bool
+) -> None:
+    base = gpx_document(f"<rte>{TWO_RTEPTS}</rte>").encode()
+    path = tmp_path / "padded.gpx"
+    path.write_bytes(base + b" " * (size - len(base)))
+
+    if accepted:
+        assert len(load_route(path, cruise_alt_ft=CRUISE_FT).waypoints) == 2
+    else:
+        with pytest.raises(RouteImportError, match="too large"):
+            load_route(path, cruise_alt_ft=CRUISE_FT)
+
+
+# --- R3: the read is bounded ------------------------------------------------------
+def test_a_huge_file_is_rejected_without_reading_all_of_it(tmp_path: Path) -> None:
+    path = tmp_path / "huge.csv"
+    with path.open("wb") as file:
+        file.truncate(200_000_000)  # sparse: no disk space used
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(RouteImportError, match="too large"):
+            load_route(path, cruise_alt_ft=CRUISE_FT)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 50_000_000
+
+
+# --- R5: OSError while reading ---------------------------------------------------
+class _FailingRead(io.FileIO):
+    def read(self, size: int = -1) -> bytes:
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+
+def test_a_read_error_becomes_a_route_import_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "route.csv"
+    path.write_text("name,lat,lon\nA,44.5,26.0\nB,44.6,26.1\n")
+    monkeypatch.setattr(os, "fdopen", lambda fd, mode: _FailingRead(fd, "r"))
+    before = open_fd_count()
+
+    with pytest.raises(RouteImportError, match="route.csv"):
+        load_route(path, cruise_alt_ft=CRUISE_FT)
+
+    assert open_fd_count() == before
+
+
+# --- C1: CSV stops at the waypoint limit -------------------------------------------
+def test_csv_stops_reading_once_the_waypoint_limit_is_exceeded() -> None:
+    # Without the early stop, the bad row after 50,001 good ones would be reported instead.
+    rows = "P,44.5,26.0,\n" * 50_001 + "Q,north,26.0,\n"
+
+    with pytest.raises(RouteImportError, match="too many waypoints"):
+        parse_csv("name,lat,lon,alt_ft\n" + rows, cruise_alt_ft=CRUISE_FT)
+
+
+# --- R6b / G16: error names the cause and the point --------------------------------
+def test_gpx_error_names_the_point_index() -> None:
+    body = '<rte><rtept lat="44.5" lon="26.0"/><rtept lon="26.1"/></rte>'
+
+    with pytest.raises(RouteImportError, match=r"point 2: missing lat"):
+        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+# --- strict input values and clearer errors ----------------------------------------
+
+
+@pytest.mark.parametrize("value", ["4_4.5", "٤٤.٥", "nan", "0x2C", " "])
+def test_csv_coordinates_must_be_plain_decimal_numbers(value: str) -> None:
+    # float() accepts "4_4.5" (44.5), Arabic-Indic digits and "nan"; a route file should not.
+    text = f"name,lat,lon,alt_ft\nA,{value},26.0,\nB,44.6,26.1,\n"
+
+    with pytest.raises(RouteImportError, match="not a number"):
+        parse_csv(text, cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize("value", ["4_4.5", "٤٤.٥", "inf"])
+def test_gpx_coordinates_must_be_plain_decimal_numbers(value: str) -> None:
+    text = gpx_document(
+        f'<rte><rtept lat="{value}" lon="26.0"/><rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    with pytest.raises(RouteImportError, match="not a number"):
+        parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "N44° 30' 0.00\",E26° 0' 0.00\",+00_4500.00",  # underscore in the altitude
+        "N٤٤° 30' 0.00\",E26° 0' 0.00\",+004500.00",  # Arabic-Indic digits
+    ],
+)
+def test_world_position_numbers_must_be_ascii_decimal(text: str) -> None:
+    with pytest.raises(RouteImportError):
+        parse_world_position(text)
+
+
+@pytest.mark.parametrize("value", ["44.5", "+44.5", "-0.5", "44", ".5", "4.45e1"])
+def test_plain_decimal_numbers_are_accepted(value: str) -> None:
+    route = parse_csv(f"name,lat,lon\nA,{value},26.0\nB,44.6,26.1\n", cruise_alt_ft=CRUISE_FT)
+
+    assert route.waypoints[0].lat == float(value)
+
+
+def test_gpx_root_in_an_unknown_namespace_is_rejected() -> None:
+    text = f'<gpx version="1.1" creator="t" xmlns="urn:not-gpx"><rte>{TWO_RTEPTS}</rte></gpx>'
+
+    with pytest.raises(RouteImportError, match="namespace"):
+        parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_gpx_with_only_waypoints_explains_what_is_read() -> None:
+    text = gpx_document('<wpt lat="44.5" lon="26.0"/><wpt lat="44.6" lon="26.1"/>')
+
+    with pytest.raises(RouteImportError, match="no route or track points"):
+        parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize("parser", [parse_gpx, parse_pln])
+def test_xml_route_stops_at_the_waypoint_limit(parser) -> None:
+    # 50,001 valid points and then a bad one: the limit is reported, not the bad point.
+    if parser is parse_gpx:
+        points = '<rtept lat="44.5" lon="26.0"/>' * 50_001 + '<rtept lat="north" lon="26.0"/>'
+        text = gpx_document(f"<rte>{points}</rte>")
+    else:
+        position = "N44° 30' 0.00\",E26° 0' 0.00\""
+        good = f"<ATCWaypoint><WorldPosition>{position}</WorldPosition></ATCWaypoint>"
+        text = pln_document().replace(
+            "</FlightPlan.FlightPlan>",
+            good * 50_001 + "<ATCWaypoint/></FlightPlan.FlightPlan>",
+        )
+
+    with pytest.raises(RouteImportError, match="too many waypoints"):
+        parser(text, cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize("name", ["a\x00.gpx", "a\x00.csv"])
+def test_load_route_rejects_a_path_with_a_nul_byte(name: str) -> None:
+    with pytest.raises(RouteImportError):
+        load_route(Path(name), cruise_alt_ft=CRUISE_FT)

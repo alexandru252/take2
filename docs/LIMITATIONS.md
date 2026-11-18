@@ -34,6 +34,10 @@ questions that are not decided yet.
 - **MSFS `.pln` altitude 0.** `+000000.00` is read as 0 ft, not as "no altitude". It is not
   certain whether flight planners write 0 for waypoints without an altitude.
 - **GPX with several routes.** The points of all routes are joined in file order.
+- **GPX contents read.** Only route points (`rte/rtept`) or, without a route, track points
+  (`trk/trkseg/trkpt`) of GPX 1.0 or 1.1 are read. Standalone waypoints (`wpt`) are ignored.
+- **Numbers must be plain decimals** (for example `44.5`, `-26.1`, `4.45e1`). Values such as
+  `4_4.5`, `nan`, `inf` or digits from other scripts are rejected instead of being guessed.
 
 ## Geometry
 
