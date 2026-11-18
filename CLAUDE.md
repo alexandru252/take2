@@ -38,7 +38,10 @@ Before every commit, run the same three checks as CI: `ruff check`, `ruff format
 ## Conventions already in place
 
 - Domain models are pydantic v2 in `src/take2/models.py`; they validate their own invariants.
-- Unit conversions live in `src/take2/altimetry.py` (`FT_PER_M`, `FT_PER_FL`); reuse them.
+- Unit conversions live in `src/take2/altimetry.py` (`FT_PER_M`, `FT_PER_FL`) and
+  `src/take2/geo.py` (`M_PER_NM`); reuse them.
+- Geometry: distances along the route are WGS84 geodesics; lateral distances are measured in
+  `geo.LocalProjection` (azimuthal equidistant, centred on the route midpoint).
 - Import errors are domain exceptions that subclass `ValueError` and name the failing line or
   item (see `RouteImportError` in `src/take2/io/routes.py`).
 - `SPEC.md` is excluded from `ruff format`, so its snippets stay as written.
