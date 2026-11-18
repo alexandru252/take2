@@ -1,6 +1,6 @@
 {
   "limit": 1000,
-  "totalCount": 4,
+  "totalCount": 5,
   "totalPages": 1,
   "page": 1,
   "items": [
@@ -24,9 +24,29 @@
       },
       "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
       "upperLimit": {"value": 3500, "unit": 1, "referenceDatum": 1},
+      "lowerLimitMin": {"value": 1000, "unit": 1, "referenceDatum": 0},
+      "upperLimitMax": {"value": 4500, "unit": 1, "referenceDatum": 1},
+      "hoursOfOperation": {
+        "operatingHours": [
+          {
+            "dayOfWeek": 0,
+            "startTime": "08:00",
+            "endTime": "16:00",
+            "sunrise": false,
+            "sunset": false,
+            "byNotam": false,
+            "publicHolidaysExcluded": false
+          }
+        ]
+      },
       "frequencies": [
         {"value": "123.450", "unit": 2, "name": "FICTIONAL TOWER", "primary": true}
-      ]
+      ],
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-02-01T00:00:00.000Z",
+      "createdBy": "fictional-editor",
+      "updatedBy": "fictional-editor",
+      "__v": 0
     },
     {
       "_id": "fictional-bravo-tma",
@@ -80,6 +100,20 @@
       "geometry": {"type": "Point", "coordinates": [26.0, 44.0]},
       "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
       "upperLimit": {"value": 2000, "unit": 1, "referenceDatum": 1}
+    },
+    {
+      "_id": "fictional-echo-p",
+      "name": "FICTIONAL ECHO P",
+      "type": 3,
+      "country": "RO",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[26.3, 44.5], [26.35, 44.5], [26.35, 44.55], [26.3, 44.55], [26.3, 44.5]]
+        ]
+      },
+      "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
+      "upperLimit": {"value": 999, "unit": 6, "referenceDatum": 2}
     }
   ]
 }

@@ -85,12 +85,22 @@ def fetch_airspace(
     result = parse_openaip_airspaces(items)
     typer.echo(f"Saved {len(items)} openAIP airspaces for {country} to {path}.")
     if result.skipped:
-        typer.echo(f"{result.skipped} of them cannot be used by Take2 and will be skipped:")
-        for problem in result.problems[:MAX_SHOWN_PROBLEMS]:
-            typer.echo(f"  {problem}")
-        if result.skipped > MAX_SHOWN_PROBLEMS:
-            typer.echo(f"  ... and {result.skipped - MAX_SHOWN_PROBLEMS} more")
+        typer.echo(f"{_items(result.skipped)} cannot be used by Take2 and will be skipped.")
+    if result.defaulted:
+        typer.echo(
+            f"{_items(result.defaulted)} will be used with a default for a field Take2 cannot read."
+        )
+    shown = result.problems[:MAX_SHOWN_PROBLEMS]
+    for problem in shown:
+        typer.echo(f"  {problem}")
+    hidden = result.skipped + result.defaulted - len(shown)
+    if hidden > 0:
+        typer.echo(f"  ... and {hidden} more")
     typer.echo(ATTRIBUTION)
+
+
+def _items(count: int) -> str:
+    return f"{count} item" if count == 1 else f"{count} items"
 
 
 def _fail(message: str) -> NoReturn:

@@ -52,8 +52,8 @@ MAX_ENV_FILE_SIZE = 1_000_000  # bytes; a .env file is a few lines
 
 # Generous on purpose (room for large countries); it bounds what a hostile file can cost.
 MAX_OPENAIP_FILE_SIZE = 100_000_000  # bytes
-MAX_REPORTED_PROBLEMS = 20  # skipped items are all counted, but only these are described
-MAX_TYPE_CODE = 999  # openAIP type codes are small; larger numbers are treated as malformed
+MAX_REPORTED_PROBLEMS = 20  # every problem item is counted, but only these are described
+MAX_TYPE_CODE = 999  # openAIP type codes are small; a larger number is read as OTHER
 _ERROR_PREVIEW_CHARS = 40
 _COUNTRY_RE = re.compile(r"[A-Za-z]{2}")  # used with fullmatch: no trailing newline
 _API_KEY_RE = re.compile(r"[!-~]+")  # visible ASCII: valid in a header, nothing to escape
@@ -137,11 +137,13 @@ class OpenAipFetchError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ParseResult:
-    """Airspaces converted from openAIP items, and the items that were skipped."""
+    """Airspaces converted from openAIP items, and what could not be read as published."""
 
     airspaces: list[Airspace]
-    skipped: int  # number of items that could not be converted
-    problems: list[str]  # why, for the first MAX_REPORTED_PROBLEMS skipped items
+    skipped: int  # items that could not be converted at all
+    # One line per skipped or defaulted item, for the first MAX_REPORTED_PROBLEMS of them.
+    problems: list[str]
+    defaulted: int  # items converted with a default for a field that could not be read
 
 
 class _SkipItem(Exception):
@@ -149,31 +151,63 @@ class _SkipItem(Exception):
 
 
 def parse_openaip_airspaces(items: Iterable[object]) -> ParseResult:
-    """Convert openAIP airspace items to ``Airspace`` models, skipping unusable items.
+    """Convert openAIP airspace items to ``Airspace`` models.
 
-    An item is skipped (and counted) when a field Take2 needs is missing or has the wrong
-    JSON type, when it uses a unit, reference datum or ICAO class code Take2 does not know,
-    when its geometry is not a single-ring Polygon, when it fails model validation, or when
-    its ``_id`` was already seen. An unknown *type* code ``n`` is kept as ``"TYPE_n"``.
-    Open rings are closed. The input is not modified.
+    An item is skipped only when Take2 cannot know where the airspace is: it is not an
+    object, a vertical limit cannot be read (missing, unknown unit or reference datum, value
+    not a finite number), its geometry is not a usable single-ring Polygon, or it fails
+    model validation. An exact repeat of an earlier item (same ``_id``, same content) is
+    skipped too.
+
+    A field that only describes the airspace never drops it; it gets a default and the item
+    is counted as defaulted: no usable ``_id`` -> ``openaip-item-<n>``, no usable name ->
+    the id, missing or invalid ``type`` -> ``"OTHER"``, unknown ``icaoClass`` -> no class.
+    A missing or null ``icaoClass`` means unclassified (the schema makes it optional) and
+    is not reported. An unknown type code ``n`` is kept as ``"TYPE_n"``. An ``_id`` already
+    used by a different item gets a ``#2``, ``#3``, ... suffix. Open rings are closed.
+    The input is not modified.
     """
     airspaces: list[Airspace] = []
     problems: list[str] = []
     skipped = 0
-    seen_ids: set[str] = set()
+    defaulted = 0
+    kept: dict[str, tuple[int, object]] = {}  # id -> (item number, raw item)
+    next_suffix: dict[str, int] = {}  # keeps renaming linear when one id repeats often
     for index, item in enumerate(items, start=1):
+        notes: list[str] = []
         try:
-            airspace = _convert_item(item)
-            if airspace.id in seen_ids:
-                raise _SkipItem(f"duplicate _id {_preview(airspace.id)!r}")
+            airspace = _convert_item(item, index, notes)
+            if airspace.id in kept:
+                first_index, first_item = kept[airspace.id]
+                if item == first_item:
+                    raise _SkipItem(f"same _id and content as item {first_index}")
+                new_id = _unused_id(airspace.id, kept, next_suffix)
+                notes.append(
+                    f"_id {_preview(airspace.id)!r} already used by item {first_index}, "
+                    f"read as {_preview(new_id)!r}"
+                )
+                airspace = airspace.model_copy(update={"id": new_id})
         except _SkipItem as exc:
             skipped += 1
             if len(problems) < MAX_REPORTED_PROBLEMS:
-                problems.append(f"item {index}{_describe_item(item)}: {exc}")
+                problems.append(f"item {index}{_describe_item(item)} skipped: {exc}")
             continue
-        seen_ids.add(airspace.id)
+        kept[airspace.id] = (index, item)
         airspaces.append(airspace)
-    return ParseResult(airspaces=airspaces, skipped=skipped, problems=problems)
+        if notes:
+            defaulted += 1
+            if len(problems) < MAX_REPORTED_PROBLEMS:
+                problems.append(f"item {index}{_describe_item(item)}: {'; '.join(notes)}")
+    return ParseResult(airspaces=airspaces, skipped=skipped, problems=problems, defaulted=defaulted)
+
+
+def _unused_id(airspace_id: str, used: dict[str, object], next_suffix: dict[str, int]) -> str:
+    """``airspace_id`` with the lowest ``#n`` suffix (n >= 2) not used yet."""
+    suffix = next_suffix.get(airspace_id, 2)
+    while f"{airspace_id}#{suffix}" in used:
+        suffix += 1
+    next_suffix[airspace_id] = suffix + 1
+    return f"{airspace_id}#{suffix}"
 
 
 def load_openaip_file(path: str | Path) -> ParseResult:
@@ -321,27 +355,30 @@ def _finite_float(text: str) -> float:
     return value
 
 
-def _convert_item(item: object) -> Airspace:
-    """Convert one openAIP item; raise ``_SkipItem`` when it cannot be used."""
+def _convert_item(item: object, index: int, notes: list[str]) -> Airspace:
+    """Convert one openAIP item, appending a note for every default it needed.
+
+    Raises ``_SkipItem`` when the item's position in space (limits, geometry) is unknown.
+    """
     if not isinstance(item, dict):
         raise _SkipItem(f"expected an object, got {_json_type(item)}")
-    airspace_id = _text(item, "_id")
-    name = _text(item, "name")
-    type_code = _code(item, "type")
-    if type_code > MAX_TYPE_CODE:
-        raise _SkipItem(f"type {type_code} is not an openAIP type code")
-    class_code = _code(item, "icaoClass")
-    if class_code not in ICAO_CLASS_BY_CODE:
-        raise _SkipItem(f"unknown icaoClass {class_code}")
     lower = _vertical_limit(item, "lowerLimit")
     upper = _vertical_limit(item, "upperLimit")
     ring = _polygon_ring(item.get("geometry"))
+    airspace_id = _text(item.get("_id"))
+    if airspace_id is None:
+        airspace_id = f"openaip-item-{index}"
+        notes.append(f"no usable _id, read as {airspace_id!r}")
+    name = _text(item.get("name"))
+    if name is None:
+        name = airspace_id
+        notes.append(f"no usable name, read as {_preview(name)!r}")
     try:
         return Airspace(
             id=airspace_id,
             name=name,
-            type=TYPE_BY_CODE.get(type_code, f"TYPE_{type_code}"),
-            icao_class=ICAO_CLASS_BY_CODE[class_code],
+            type=_airspace_type(item.get("type"), notes),
+            icao_class=_icao_class(item.get("icaoClass"), notes),
             lower=lower,
             upper=upper,
             polygon_lonlat=ring,
@@ -350,18 +387,49 @@ def _convert_item(item: object) -> Airspace:
         raise _SkipItem(_describe_validation_error(exc)) from None
 
 
-def _text(item: dict[object, object], key: str) -> str:
-    value = item.get(key)
-    if not isinstance(value, str) or not value:
-        raise _SkipItem(f"{key} must be a non-empty string, got {_json_type(value)}")
+def _text(value: object) -> str | None:
+    """A non-blank string, or None when ``value`` cannot be used as text."""
+    if not isinstance(value, str) or not value.strip():
+        return None
     return value
 
 
-def _code(container: dict[object, object], key: str) -> int:
-    value = container.get(key)
+def _airspace_type(value: object, notes: list[str]) -> str:
+    if value is None:  # missing or null
+        notes.append("no type, read as OTHER")
+        return "OTHER"
+    code = _int_code(value)
+    if code is None or code > MAX_TYPE_CODE:
+        notes.append(f"type is not a known openAIP code ({_describe_code(value)}), read as OTHER")
+        return "OTHER"
+    return TYPE_BY_CODE.get(code, f"TYPE_{code}")
+
+
+def _icao_class(value: object, notes: list[str]) -> str | None:
+    if value is None:  # missing or null: optional in the schema, like code 8
+        return None
+    code = _int_code(value)
+    if code not in ICAO_CLASS_BY_CODE:  # None (not a code) is never a key
+        notes.append(
+            f"icaoClass is not a known openAIP code ({_describe_code(value)}), read as unclassified"
+        )
+        return None
+    return ICAO_CLASS_BY_CODE[code]
+
+
+def _int_code(value: object) -> int | None:
+    """``value`` if it is a whole number >= 0 (booleans are not), else None."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise _SkipItem(f"{key} must be a code (an integer >= 0), got {_json_type(value)}")
+        return None
     return value
+
+
+def _describe_code(value: object) -> str:
+    """A short description of a code from untrusted input, for a problem line."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        # JSON integers can have 4,300 digits; never print (or str()) a huge one.
+        return str(value) if value.bit_length() <= 64 else "a huge number"
+    return _json_type(value)
 
 
 def _number(value: object) -> float | None:
@@ -382,12 +450,15 @@ def _vertical_limit(item: dict[object, object], key: str) -> VerticalLimit:
     value = _number(limit.get("value"))
     if value is None:
         raise _SkipItem(f"{key}.value must be a finite number")
-    unit_code = _code(limit, "unit")
+    unit_code = _int_code(limit.get("unit"))
     if unit_code not in UNIT_BY_CODE:
-        raise _SkipItem(f"{key}: unknown unit {unit_code}")
-    reference_code = _code(limit, "referenceDatum")
+        raise _SkipItem(
+            f"{key}.unit is not a known openAIP code ({_describe_code(limit.get('unit'))})"
+        )
+    reference_code = _int_code(limit.get("referenceDatum"))
     if reference_code not in REFERENCE_BY_CODE:
-        raise _SkipItem(f"{key}: unknown referenceDatum {reference_code}")
+        shown = _describe_code(limit.get("referenceDatum"))
+        raise _SkipItem(f"{key}.referenceDatum is not a known openAIP code ({shown})")
     return VerticalLimit(
         value=value, unit=UNIT_BY_CODE[unit_code], reference=REFERENCE_BY_CODE[reference_code]
     )
@@ -400,7 +471,7 @@ def _polygon_ring(geometry: object) -> list[tuple[float, float]]:
     geometry_type = geometry.get("type")
     if geometry_type != "Polygon":
         shown = geometry_type if isinstance(geometry_type, str) else _json_type(geometry_type)
-        raise _SkipItem(f"geometry type {_preview(shown)!r} is not supported: only Polygon")
+        raise _SkipItem(f"geometry type {_preview(shown)!r} is not supported (only Polygon)")
     rings = geometry.get("coordinates")
     if not isinstance(rings, list) or len(rings) != 1 or not isinstance(rings[0], list):
         raise _SkipItem("a Polygon must have exactly one ring (holes are not supported)")

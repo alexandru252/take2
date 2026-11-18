@@ -107,6 +107,7 @@ def test_fetch_airspace_saves_the_items_to_data_country_json(
         "FICTIONAL ALPHA CTR",
         "FICTIONAL BRAVO TMA",
         "FICTIONAL CHARLIE TMZ",
+        "FICTIONAL ECHO P",
     ]
     assert saved.skipped == 1
     document = json.loads((workdir / "data" / "ro.json").read_text(encoding="utf-8"))
@@ -120,12 +121,36 @@ def test_fetch_airspace_reports_the_count_the_skips_and_the_attribution(
     result = run("fetch-airspace", "--country", "RO")
 
     assert result.exit_code == 0, result.output
-    lines = result.stdout.splitlines()
-    assert lines[0] == f"Saved 4 openAIP airspaces for RO to {Path('data', 'ro.json')}."
-    assert lines[1] == "1 of them cannot be used by Take2 and will be skipped:"
-    assert lines[2].startswith("  item 4 ('FICTIONAL DELTA BROKEN'): ")
-    assert lines[-1] == ATTRIBUTION
+    assert result.stdout.splitlines() == [
+        f"Saved 5 openAIP airspaces for RO to {Path('data', 'ro.json')}.",
+        "1 item cannot be used by Take2 and will be skipped.",
+        "  item 4 ('FICTIONAL DELTA BROKEN') skipped: geometry type 'Point' is not supported "
+        "(only Polygon)",
+        ATTRIBUTION,
+    ]
     assert result.stderr == ""
+
+
+@pytest.mark.usefixtures("with_key")
+def test_fetch_airspace_reports_airspaces_read_with_a_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    items = fixture_items()[:2]
+    items[0]["icaoClass"] = 7  # not an openAIP class code
+    items[1]["type"] = "TMA"  # not a code at all
+    monkeypatch.setattr(cli, "fetch_airspaces", lambda country, api_key: items)
+
+    result = run("fetch-airspace", "--country", "RO")
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[1] == "2 items will be used with a default for a field Take2 cannot read."
+    assert lines[2] == (
+        "  item 1 ('FICTIONAL ALPHA CTR'): icaoClass is not a known openAIP code (7), "
+        "read as unclassified"
+    )
+    assert lines[3].startswith("  item 2 ('FICTIONAL BRAVO TMA'): type is not")
+    assert lines[4] == ATTRIBUTION
 
 
 @pytest.mark.usefixtures("with_key")
@@ -141,6 +166,27 @@ def test_fetch_airspace_shows_at_most_five_problems(
     problem_lines = [line for line in result.stdout.splitlines() if line.startswith("  item ")]
     assert len(problem_lines) == 5
     assert "  ... and 3 more" in result.stdout.splitlines()
+
+
+@pytest.mark.usefixtures("with_key")
+def test_the_hidden_problem_count_includes_skipped_and_defaulted_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template = fixture_items()[1]  # the TMA
+    broken = [{"_id": f"broken-{n}", "name": f"FICTIONAL {n}"} for n in range(4)]
+    odd = [{**template, "_id": f"odd-{n}", "icaoClass": 7} for n in range(4)]
+    monkeypatch.setattr(cli, "fetch_airspaces", lambda country, api_key: broken + odd)
+
+    result = run("fetch-airspace", "--country", "RO")
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[1:3] == [
+        "4 items cannot be used by Take2 and will be skipped.",
+        "4 items will be used with a default for a field Take2 cannot read.",
+    ]
+    assert len([line for line in lines if line.startswith("  item ")]) == 5
+    assert "  ... and 3 more" in lines
 
 
 @pytest.mark.usefixtures("with_key")
@@ -161,7 +207,7 @@ def test_output_option_chooses_the_file_and_creates_its_directories(workdir: Pat
     result = run("fetch-airspace", "--country", "RO", "--output", str(target))
 
     assert result.exit_code == 0, result.output
-    assert len(load_openaip_file(target).airspaces) == 3
+    assert len(load_openaip_file(target).airspaces) == 4
     assert not (workdir / "data").exists()
     assert str(target) in result.stdout
 
@@ -174,7 +220,7 @@ def test_an_existing_file_is_replaced_and_no_temporary_file_is_left(workdir: Pat
     result = run("fetch-airspace", "--country", "RO")
 
     assert result.exit_code == 0, result.output
-    assert len(load_openaip_file(workdir / "data" / "ro.json").airspaces) == 3
+    assert len(load_openaip_file(workdir / "data" / "ro.json").airspaces) == 4
     assert [p.name for p in (workdir / "data").iterdir()] == ["ro.json"]
 
 

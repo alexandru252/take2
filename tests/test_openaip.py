@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import threading
+import time
 import traceback
 import tracemalloc
 import zlib
@@ -144,14 +145,16 @@ def write_json(path: Path, document: object) -> Path:
 # --- the fictional fixture --------------------------------------------------------
 
 
-def test_fixture_converts_the_three_valid_airspaces_in_file_order() -> None:
+def test_fixture_converts_the_four_usable_airspaces_in_file_order() -> None:
     result = load_openaip_file(FIXTURE)
 
     assert [a.name for a in result.airspaces] == [
         "FICTIONAL ALPHA CTR",
         "FICTIONAL BRAVO TMA",
         "FICTIONAL CHARLIE TMZ",
+        "FICTIONAL ECHO P",
     ]
+    assert result.defaulted == 0
 
 
 def test_fixture_skips_and_counts_the_item_with_point_geometry() -> None:
@@ -159,8 +162,29 @@ def test_fixture_skips_and_counts_the_item_with_point_geometry() -> None:
 
     assert result.skipped == 1
     (problem,) = result.problems
-    assert problem.startswith("item 4 ('FICTIONAL DELTA BROKEN'): ")
-    assert "Point" in problem
+    assert problem == (
+        "item 4 ('FICTIONAL DELTA BROKEN') skipped: geometry type 'Point' is not supported "
+        "(only Polygon)"
+    )
+
+
+def test_fixture_ctr_ignores_fields_take2_does_not_model() -> None:
+    # The CTR item also has lowerLimitMin, upperLimitMax, hoursOfOperation and audit fields.
+    ctr = by_name(load_openaip_file(FIXTURE), "FICTIONAL ALPHA CTR")
+
+    assert ctr.lower.value == 0
+    assert ctr.upper.value == 3500
+
+
+def test_fixture_prohibited_area_without_icao_class_is_kept_unclassified() -> None:
+    # icaoClass is optional in the openAIP schema; a P area without it must not vanish.
+    area = by_name(load_openaip_file(FIXTURE), "FICTIONAL ECHO P")
+
+    assert area.type == "P"
+    assert area.icao_class is None
+    assert area.lower == VerticalLimit(value=0, unit="FT", reference=LimitReference.GND)
+    # A very high flight level stands in for an unlimited ("UNL") upper limit.
+    assert area.upper == VerticalLimit(value=999, unit="FL", reference=LimitReference.STD)
 
 
 def test_fixture_ctr_is_class_d_from_the_surface_to_3500_ft_msl() -> None:
@@ -301,30 +325,13 @@ def test_integer_coordinates_are_accepted() -> None:
     assert airspace.polygon_lonlat[1] == (27.0, 44.0)
 
 
-# --- skipped items ----------------------------------------------------------------
+# --- skipped items: the limits or the geometry cannot be read ----------------------
 
-BROKEN_ITEMS: dict[str, object] = {
+SKIPPED_ITEMS: dict[str, object] = {
     "item is a number": 42,
     "item is a string": "FICTIONAL",
     "item is a list": [],
     "item is null": None,
-    "missing _id": make_item(_id=MISSING),
-    "_id is a number": make_item(_id=123),
-    "_id is empty": make_item(_id=""),
-    "missing name": make_item(name=MISSING),
-    "name is a list": make_item(name=["FICTIONAL"]),
-    "name is empty": make_item(name=""),
-    "missing type": make_item(type=MISSING),
-    "type is a boolean": make_item(type=True),
-    "type is a string": make_item(type="4"),
-    "type is a decimal number": make_item(type=4.0),
-    "type is negative": make_item(type=-1),
-    "type is 1000 or more": make_item(type=1000),
-    "missing icaoClass": make_item(icaoClass=MISSING),
-    "icaoClass is null": make_item(icaoClass=None),
-    "icaoClass 7 is not defined": make_item(icaoClass=7),
-    "icaoClass is a boolean": make_item(icaoClass=False),
-    "icaoClass is a letter": make_item(icaoClass="D"),
     "missing lowerLimit": make_item(lowerLimit=MISSING),
     "missing upperLimit": make_item(upperLimit=MISSING),
     "lowerLimit is a list": make_item(lowerLimit=[65, 6, 2]),
@@ -373,18 +380,19 @@ BROKEN_ITEMS: dict[str, object] = {
 }
 
 
-@pytest.mark.parametrize("item", BROKEN_ITEMS.values(), ids=BROKEN_ITEMS.keys())
-def test_a_broken_item_is_skipped_and_counted(item: object) -> None:
+@pytest.mark.parametrize("item", SKIPPED_ITEMS.values(), ids=SKIPPED_ITEMS.keys())
+def test_an_item_whose_limits_or_geometry_cannot_be_read_is_skipped(item: object) -> None:
     result = parse_openaip_airspaces([item])
 
     assert result.airspaces == []
-    assert result.skipped == 1
+    assert (result.skipped, result.defaulted) == (1, 0)
     (problem,) = result.problems
     assert problem.startswith("item 1")
+    assert " skipped: " in problem
 
 
-@pytest.mark.parametrize("item", BROKEN_ITEMS.values(), ids=BROKEN_ITEMS.keys())
-def test_a_broken_item_does_not_stop_the_items_after_it(item: object) -> None:
+@pytest.mark.parametrize("item", SKIPPED_ITEMS.values(), ids=SKIPPED_ITEMS.keys())
+def test_a_skipped_item_does_not_stop_the_items_after_it(item: object) -> None:
     items = [make_item(_id="first"), item, make_item(_id="third")]
 
     result = parse_openaip_airspaces(items)
@@ -394,34 +402,196 @@ def test_a_broken_item_does_not_stop_the_items_after_it(item: object) -> None:
     assert result.problems[0].startswith("item 2")
 
 
-def test_the_problem_names_the_airspace_and_the_reason() -> None:
+# --- kept items: a field that only describes the airspace gets a default ------------
+
+# (item, attribute, expected value, problem line expected?)
+DEFAULTED_ITEMS: dict[str, tuple[object, str, object, bool]] = {
+    "missing icaoClass": (make_item(icaoClass=MISSING), "icao_class", None, False),
+    "icaoClass is null": (make_item(icaoClass=None), "icao_class", None, False),
+    "icaoClass 7 is not defined": (make_item(icaoClass=7), "icao_class", None, True),
+    "icaoClass is a boolean": (make_item(icaoClass=False), "icao_class", None, True),
+    "icaoClass is a letter": (make_item(icaoClass="D"), "icao_class", None, True),
+    "icaoClass is negative": (make_item(icaoClass=-1), "icao_class", None, True),
+    "icaoClass is a decimal number": (make_item(icaoClass=3.0), "icao_class", None, True),
+    "missing type": (make_item(type=MISSING), "type", "OTHER", True),
+    "type is null": (make_item(type=None), "type", "OTHER", True),
+    "type is a boolean": (make_item(type=True), "type", "OTHER", True),
+    "type is a string": (make_item(type="4"), "type", "OTHER", True),
+    "type is a decimal number": (make_item(type=4.0), "type", "OTHER", True),
+    "type is negative": (make_item(type=-1), "type", "OTHER", True),
+    "type is 1000 or more": (make_item(type=1000), "type", "OTHER", True),
+    "missing name": (make_item(name=MISSING), "name", "fictional-0001", True),
+    "name is a list": (make_item(name=["FICTIONAL"]), "name", "fictional-0001", True),
+    "name is empty": (make_item(name=""), "name", "fictional-0001", True),
+    "name is blank": (make_item(name="   "), "name", "fictional-0001", True),
+    "missing _id": (make_item(_id=MISSING), "id", "openaip-item-1", True),
+    "_id is a number": (make_item(_id=123), "id", "openaip-item-1", True),
+    "_id is empty": (make_item(_id=""), "id", "openaip-item-1", True),
+}
+
+
+@pytest.mark.parametrize(
+    ("item", "attribute", "expected", "reported"),
+    DEFAULTED_ITEMS.values(),
+    ids=DEFAULTED_ITEMS.keys(),
+)
+def test_an_unreadable_descriptive_field_gets_a_default_instead_of_dropping_the_airspace(
+    item: object, attribute: str, expected: object, reported: bool
+) -> None:
+    result = parse_openaip_airspaces([item])
+
+    (airspace,) = result.airspaces
+    assert getattr(airspace, attribute) == expected
+    assert result.skipped == 0
+    assert result.defaulted == (1 if reported else 0)
+    assert len(result.problems) == (1 if reported else 0)
+    if reported:
+        assert result.problems[0].startswith("item 1")
+        assert " skipped" not in result.problems[0]
+
+
+def test_an_unknown_icao_class_is_reported_and_read_as_unclassified() -> None:
     item = make_item(name="FICTIONAL ECHO", icaoClass=7)
 
     (problem,) = parse_openaip_airspaces([item]).problems
 
-    assert problem == "item 1 ('FICTIONAL ECHO'): unknown icaoClass 7"
+    assert problem == (
+        "item 1 ('FICTIONAL ECHO'): icaoClass is not a known openAIP code (7), read as unclassified"
+    )
 
 
-def test_an_item_with_an_already_seen_id_is_skipped() -> None:
-    items = [make_item(name="FICTIONAL FIRST"), make_item(name="FICTIONAL COPY")]
+def test_a_missing_type_is_reported_and_read_as_other() -> None:
+    (problem,) = parse_openaip_airspaces([make_item(type=MISSING)]).problems
+
+    assert problem == "item 1 ('FICTIONAL TEST TMA'): no type, read as OTHER"
+
+
+def test_an_item_without_id_or_name_is_named_after_its_generated_id() -> None:
+    result = parse_openaip_airspaces([make_item(), make_item(_id=MISSING, name=MISSING)])
+
+    second = result.airspaces[1]
+    assert (second.id, second.name) == ("openaip-item-2", "openaip-item-2")
+    assert result.problems == [
+        "item 2: no usable _id, read as 'openaip-item-2'; no usable name, read as 'openaip-item-2'"
+    ]
+
+
+def test_all_problems_of_one_item_are_on_one_line_and_it_counts_once() -> None:
+    result = parse_openaip_airspaces([make_item(type="x", icaoClass="y")])
+
+    assert result.defaulted == 1
+    (problem,) = result.problems
+    assert "type" in problem
+    assert "icaoClass" in problem
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        make_item(type=10**4000),
+        make_item(icaoClass=10**4000),
+        make_item(lowerLimit=limit(unit=10**4000)),
+        make_item(upperLimit=limit(reference=10**4000)),
+    ],
+    ids=["type", "icaoClass", "unit", "referenceDatum"],
+)
+def test_a_huge_integer_code_is_not_echoed(item: object) -> None:
+    (problem,) = parse_openaip_airspaces([item]).problems
+
+    assert "a huge number" in problem
+    assert len(problem) < 200
+
+
+# --- duplicate ids ----------------------------------------------------------------
+
+
+def test_an_exact_duplicate_is_skipped() -> None:
+    items = [make_item(), make_item()]
 
     result = parse_openaip_airspaces(items)
 
-    assert [a.name for a in result.airspaces] == ["FICTIONAL FIRST"]
+    assert len(result.airspaces) == 1
     assert result.skipped == 1
-    assert "duplicate _id 'fictional-0001'" in result.problems[0]
+    assert result.problems == [
+        "item 2 ('FICTIONAL TEST TMA') skipped: same _id and content as item 1"
+    ]
+
+
+def test_a_different_airspace_with_an_already_used_id_is_kept_under_a_new_id() -> None:
+    items = [make_item(name="FICTIONAL FIRST"), make_item(name="FICTIONAL OTHER")]
+
+    result = parse_openaip_airspaces(items)
+
+    assert [(a.id, a.name) for a in result.airspaces] == [
+        ("fictional-0001", "FICTIONAL FIRST"),
+        ("fictional-0001#2", "FICTIONAL OTHER"),
+    ]
+    assert (result.skipped, result.defaulted) == (0, 1)
+    assert result.problems == [
+        "item 2 ('FICTIONAL OTHER'): _id 'fictional-0001' already used by item 1, "
+        "read as 'fictional-0001#2'"
+    ]
+
+
+def test_new_ids_for_repeated_ids_stay_unique() -> None:
+    items = [make_item(name=f"FICTIONAL {n}") for n in range(4)] + [
+        make_item(_id="fictional-0001#3", name="FICTIONAL REAL")
+    ]
+
+    ids = [a.id for a in parse_openaip_airspaces(items).airspaces]
+
+    assert ids[:4] == ["fictional-0001", "fictional-0001#2", "fictional-0001#3", "fictional-0001#4"]
+    assert len(set(ids)) == 5  # the real "#3" id that came later is renamed too
+
+
+def test_a_new_id_never_takes_an_id_a_real_item_already_has() -> None:
+    items = [
+        make_item(_id="fictional-0001#2", name="FICTIONAL REAL"),
+        make_item(name="FICTIONAL A"),
+        make_item(name="FICTIONAL B"),
+    ]
+
+    ids = [a.id for a in parse_openaip_airspaces(items).airspaces]
+
+    assert ids == ["fictional-0001#2", "fictional-0001", "fictional-0001#3"]
+
+
+def test_an_id_first_seen_on_a_skipped_item_is_still_free() -> None:
+    items = [make_item(geometry=MISSING), make_item()]
+
+    result = parse_openaip_airspaces(items)
+
+    assert [a.id for a in result.airspaces] == ["fictional-0001"]
+    assert result.defaulted == 0
+
+
+def test_many_items_with_the_same_id_take_linear_time() -> None:
+    # Renaming by trying #2, #3, ... from the start each time would take about 2 * 10**8
+    # steps here (tens of seconds); the per-id counter keeps it to one step per item.
+    items = [make_item(name=f"FICTIONAL {n}") for n in range(20_000)]
+
+    started = time.perf_counter()
+    result = parse_openaip_airspaces(items)
+
+    assert len({a.id for a in result.airspaces}) == 20_000
+    assert time.perf_counter() - started < 5.0
+
+
+# --- problem reporting --------------------------------------------------------------
 
 
 def test_max_reported_problems_is_20() -> None:
     assert MAX_REPORTED_PROBLEMS == 20
 
 
-def test_only_the_first_problems_are_kept_but_every_skip_is_counted() -> None:
-    items = [make_item(_id=f"broken-{i}", type="x") for i in range(50)]
+def test_only_the_first_problems_are_kept_but_every_item_is_counted() -> None:
+    items = [make_item(_id=f"broken-{i}", geometry=MISSING) for i in range(30)] + [
+        make_item(_id=f"odd-{i}", type="x") for i in range(30)
+    ]
 
     result = parse_openaip_airspaces(items)
 
-    assert result.skipped == 50
+    assert (result.skipped, result.defaulted) == (30, 30)
     assert len(result.problems) == MAX_REPORTED_PROBLEMS
     assert result.problems[-1].startswith(f"item {MAX_REPORTED_PROBLEMS} ")
 
@@ -444,7 +614,9 @@ def test_a_problem_for_a_huge_invalid_ring_is_short() -> None:
 
 
 def test_no_items_give_an_empty_result() -> None:
-    assert parse_openaip_airspaces([]) == ParseResult(airspaces=[], skipped=0, problems=[])
+    assert parse_openaip_airspaces([]) == ParseResult(
+        airspaces=[], skipped=0, problems=[], defaulted=0
+    )
 
 
 def test_the_input_items_are_not_modified() -> None:
