@@ -8,6 +8,10 @@ size limit, and XML (GPX, ``.pln``) is first checked by a streaming expat pass t
 tree (see ``_check_xml``). The exact same text is then parsed with ElementTree, so what is
 checked is what is read. GPX is read directly from its ``rtept``/``trkpt`` elements; no
 third-party GPX library is involved.
+
+The ``parse_*`` functions take decoded text and limit it to ``MAX_ROUTE_FILE_SIZE``
+characters, which can be up to four times as many bytes. Code that receives raw bytes (for
+example an upload) should cap the byte count before decoding, as ``load_route`` does.
 """
 
 import csv
@@ -32,6 +36,8 @@ MAX_ROUTE_FILE_SIZE = 10_000_000  # bytes for files, characters for text
 MAX_XML_DEPTH = 64
 MAX_XML_ELEMENTS = 500_000
 MAX_XML_ATTRIBUTES = 64  # per element, namespace declarations included
+MAX_XML_NAMES = 1_000  # distinct element and attribute names per file; real files use < 100
+MAX_CSV_FIELDS = 64  # per row; a route CSV has 3 or 4 columns
 _ERROR_PREVIEW_CHARS = 40
 
 # (name or None, lat, lon, alt_ft or None) as read from a file, before validation.
@@ -73,7 +79,8 @@ def _read_route_file(path: Path) -> str:
     """
     name = _preview(path.name)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+        fd = os.open(path, flags)
     except FileNotFoundError as exc:
         raise RouteImportError(f"route file not found: {name}") from exc
     except OSError as exc:
@@ -84,6 +91,7 @@ def _read_route_file(path: Path) -> str:
         # Check the descriptor before fdopen, which itself rejects directories.
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise RouteImportError(f"route file not found or not a regular file: {name}")
+        os.set_blocking(fd, True)  # O_NONBLOCK was only for opening; read normally
         file = os.fdopen(fd, "rb")
     except BaseException:
         os.close(fd)
@@ -217,7 +225,7 @@ def parse_world_position(text: str) -> tuple[float, float, float | None]:
     Format: ``N44° 34' 21.56",E26° 5' 5.06",+004500.00`` (DMS, DMS, feet). The altitude
     part is optional and returned as ``None`` when absent. South and west are negative.
     """
-    parts = [part.strip() for part in text.split(",")]
+    parts = [part.strip() for part in text.split(",", 3)]  # bounded, even for "," * 10**7
     if len(parts) not in (2, 3):
         raise RouteImportError(f"invalid WorldPosition {_preview(text)!r}: expected lat,lon[,alt]")
     lat = _parse_dms(parts[0], hemispheres="NS")
@@ -258,6 +266,10 @@ def _csv_records(text: str) -> Iterator[tuple[int, list[str]]]:
             return
         except csv.Error as exc:
             raise RouteImportError(f"CSV line {reader.line_num}: {exc}") from exc
+        if len(fields) > MAX_CSV_FIELDS:
+            raise RouteImportError(
+                f"CSV line {reader.line_num} has more than {MAX_CSV_FIELDS} fields"
+            )
         yield reader.line_num, fields
 
 
@@ -360,19 +372,21 @@ def _check_xml(text: str, file_type: str) -> None:
     """Reject XML that Take2 does not parse, without building a tree.
 
     Rejects malformed XML, any DOCTYPE, nesting deeper than ``MAX_XML_DEPTH``, more than
-    ``MAX_XML_ELEMENTS`` elements and more than ``MAX_XML_ATTRIBUTES`` attributes on one
-    element. Rejecting every DOCTYPE removes all entity tricks (exponential or flat expansion,
-    external entities); route files never need a DTD. expat reports elements through
-    callbacks, so deep nesting cannot overflow the stack here.
+    ``MAX_XML_ELEMENTS`` elements, more than ``MAX_XML_ATTRIBUTES`` attributes on one element
+    and more than ``MAX_XML_NAMES`` distinct element and attribute names. Rejecting every
+    DOCTYPE removes all entity tricks (exponential or flat expansion, external entities);
+    route files never need a DTD. expat reports elements through callbacks, so deep nesting
+    cannot overflow the stack here.
     """
     parser = xml.parsers.expat.ParserCreate()
     depth = 0
     elements = 0
+    names: set[str] = set()
 
     def start_doctype(*_: object) -> None:
         raise RouteImportError(f"{file_type} file contains a DOCTYPE, which is not allowed")
 
-    def start_element(_name: str, attributes: dict[str, str]) -> None:
+    def start_element(name: str, attributes: dict[str, str]) -> None:
         nonlocal depth, elements
         depth += 1
         elements += 1
@@ -385,6 +399,14 @@ def _check_xml(text: str, file_type: str) -> None:
         if len(attributes) > MAX_XML_ATTRIBUTES:
             raise RouteImportError(
                 f"{file_type} file has an element with more than {MAX_XML_ATTRIBUTES} attributes"
+            )
+        # Each distinct name is cached by expat and ElementTree, so bound how many there are.
+        names.add(name)
+        names.update(attributes)
+        if len(names) > MAX_XML_NAMES:
+            raise RouteImportError(
+                f"{file_type} file uses more than {MAX_XML_NAMES:,} distinct element and "
+                "attribute names"
             )
 
     def end_element(_name: str) -> None:

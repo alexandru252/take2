@@ -54,6 +54,9 @@ questions that are not decided yet.
 
 These keep the work bounded when a route file comes from someone else.
 
+XML is checked with the expat library bundled with Python; version 2.7.2 or later is
+required (a test checks this).
+
 | Limit | Value |
 |---|---|
 | Route file size | 10 MB |
@@ -62,6 +65,8 @@ These keep the work bounded when a route file comes from someone else.
 | XML nesting depth (GPX, `.pln`) | 64 elements |
 | XML elements per file (GPX, `.pln`) | 500,000 |
 | XML attributes per element (GPX, `.pln`) | 64 |
+| Distinct XML element and attribute names (GPX, `.pln`) | 1,000 |
+| CSV fields per row | 64 |
 | DOCTYPE / DTD in GPX or `.pln` | not allowed |
 | Route length | 1,000 NM |
 | Route samples | 100,000 |

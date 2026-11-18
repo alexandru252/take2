@@ -1002,3 +1002,47 @@ def test_xml_route_stops_at_the_waypoint_limit(parser) -> None:
 def test_load_route_rejects_a_path_with_a_nul_byte(name: str) -> None:
     with pytest.raises(RouteImportError):
         load_route(Path(name), cruise_alt_ft=CRUISE_FT)
+
+
+# --- third security review: bounded memory for odd but small files -----------------
+
+
+@pytest.mark.parametrize(("names", "accepted"), [(1_000, True), (1_001, False)])
+def test_xml_distinct_name_limit_is_1000(names: int, accepted: bool) -> None:
+    # Every distinct element or attribute name is cached by expat and ElementTree; 500,000
+    # distinct names in 5 MB used about 250 MB. The document itself uses 9 names (gpx,
+    # version, creator, xmlns, rte, rtept, lat, lon, x); the rest are distinct elements.
+    extras = "".join(f"<n{i}/>" for i in range(names - 9))
+    text = gpx_document(f"<rte>{TWO_RTEPTS}</rte><x>{extras}</x>")
+
+    if accepted:
+        assert len(parse_gpx(text, cruise_alt_ft=CRUISE_FT).waypoints) == 2
+    else:
+        with pytest.raises(RouteImportError, match="names"):
+            parse_gpx(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_world_position_with_millions_of_commas_is_rejected_cheaply() -> None:
+    tracemalloc.start()
+    try:
+        with pytest.raises(RouteImportError):
+            parse_world_position("," * 2_000_000)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 20_000_000  # splitting everything used ~44 bytes per comma
+
+
+def test_csv_row_with_too_many_fields_is_rejected() -> None:
+    text = "name,lat,lon,alt_ft\nA,44.5,26.0," + "," * 100 + "\nB,44.6,26.1,\n"
+
+    with pytest.raises(RouteImportError, match="fields"):
+        parse_csv(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_expat_has_the_large_allocation_fix() -> None:
+    # The DOCTYPE ban removes the entity attacks, not CVE-2025-59375 (fixed in expat 2.7.2).
+    import pyexpat
+
+    assert pyexpat.version_info >= (2, 7, 2)
