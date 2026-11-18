@@ -248,3 +248,80 @@ def test_every_type_in_the_severity_file_is_an_openaip_type() -> None:
     used = rules.clearance_types | rules.requirement_types | rules.info_types
 
     assert used <= set(TYPE_BY_CODE.values())
+
+
+# --- review of milestone 7: honest summaries and a clean terminal --------------------
+
+
+def test_no_usable_airspace_is_a_loud_warning_not_a_clean_result(workdir: Path) -> None:
+    broken = {"_id": "bad", "name": "BROKEN", "type": 4, "icaoClass": 3}
+    airspace = write_airspace(workdir / "ro.json", [broken])
+    route = write_route(workdir / "route.csv", alt_ft=2500)
+
+    result = check(str(route), "--qnh", "1013", "--cruise", "4500", "--airspace", str(airspace))
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING: no usable airspace" in result.stdout
+    assert "keeps the Take 2 margins" not in result.stdout
+
+
+def test_no_events_says_what_was_checked(workdir: Path) -> None:
+    airspace = write_airspace(workdir / "ro.json", [TMA_ITEM])
+    route = write_route(workdir / "route.csv", alt_ft=6000)
+
+    result = check(str(route), "--qnh", "1013.25", "--cruise", "4500", "--airspace", str(airspace))
+
+    assert "No events against the airspace Take2 evaluates" in result.stdout
+    assert "all loaded airspace" not in result.stdout
+
+
+def test_defaulted_airspace_items_are_mentioned(workdir: Path) -> None:
+    unknown_class = dict(CTR_ITEM, _id="ctr9", icaoClass=7)  # 7 is not an openAIP class code
+    airspace = write_airspace(workdir / "ro.json", [CTR_ITEM, unknown_class])
+    route = write_route(workdir / "route.csv", alt_ft=2500)
+
+    result = check(str(route), "--qnh", "1013", "--cruise", "4500", "--airspace", str(airspace))
+
+    assert "1 airspace item was read with a default" in result.stdout
+
+
+def test_infringement_advice_does_not_promise_a_clearance(workdir: Path) -> None:
+    airspace = write_airspace(workdir / "ro.json", [CTR_ITEM])
+    route = write_route(workdir / "route.csv", alt_ft=2500)
+
+    result = check(str(route), "--qnh", "1013", "--cruise", "4500", "--airspace", str(airspace))
+
+    assert "prohibited areas cannot be entered" in result.stdout
+
+
+ESCAPES = "\x1b]0;PWNED\x07\x1b[1A\x1b[2K"
+
+
+@pytest.mark.parametrize("where", ["route-ok", "route-missing", "airspace-missing", "airspace-bad"])
+def test_file_names_cannot_inject_terminal_control_sequences(workdir: Path, where: str) -> None:
+    airspace = write_airspace(workdir / "ro.json", [CTR_ITEM])
+    route = write_route(workdir / f"r{ESCAPES}.csv", alt_ft=2500)
+    args = [str(route), "--qnh", "1013", "--cruise", "4500", "--airspace", str(airspace)]
+    if where == "route-missing":
+        args[0] = f"nope{ESCAPES}.csv"
+    elif where == "airspace-missing":
+        args[-1] = f"none{ESCAPES}.json"
+    elif where == "airspace-bad":
+        bad = workdir / f"bad{ESCAPES}.json"
+        bad.write_text("{not json")
+        args[-1] = str(bad)
+
+    result = check(*args)
+
+    assert "\x1b" not in result.output
+    assert "\x07" not in result.output
+
+
+def test_airspace_file_is_shown_by_name_not_by_absolute_path(workdir: Path) -> None:
+    airspace = write_airspace(workdir / "ro.json", [CTR_ITEM])
+    route = write_route(workdir / "route.csv", alt_ft=2500)
+
+    result = check(str(route), "--qnh", "1013", "--cruise", "4500", "--airspace", str(airspace))
+
+    assert str(workdir) not in result.stdout
+    assert "ro.json" in result.stdout

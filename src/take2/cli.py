@@ -151,7 +151,7 @@ def check(
         )
     if not airspace.exists():
         _fail(
-            f"no airspace data at {airspace}: download it with "
+            f"no airspace data at {airspace.name}: download it with "
             "`take2 fetch-airspace --country RO`, or give another file with --airspace"
         )
 
@@ -159,7 +159,7 @@ def check(
     try:
         data = load_openaip_file(airspace)
     except OpenAipFileError as exc:
-        failure = f"cannot read {airspace}: {exc}"
+        failure = f"cannot read {airspace.name}: {exc}"
     _fail_if(failure)
     route = None
     try:
@@ -174,23 +174,34 @@ def check(
         failure = str(exc)
     _fail_if(failure)
 
-    typer.echo(f"Take2 check: {_printable(route_file.name)}, QNH {qnh:g} hPa, cruise {cruise:g} ft")
-    loaded = f"Airspace: {airspace}, {_count(len(data.airspaces), 'airspace')} loaded"
+    _say(f"Take2 check: {route_file.name}, QNH {qnh:.2f} hPa, cruise {cruise:.0f} ft")
+    loaded = f"Airspace: {airspace.name}, {_count(len(data.airspaces), 'airspace')} loaded"
     if data.skipped:
         loaded += (
             f"; {_count(data.skipped, 'airspace item')} could not be used and "
             f"{'was' if data.skipped == 1 else 'were'} skipped"
         )
-    typer.echo(loaded)
-    typer.echo("")
+    if data.defaulted:
+        loaded += (
+            f"; {_count(data.defaulted, 'airspace item')} "
+            f"{'was' if data.defaulted == 1 else 'were'} read with a default"
+        )
+    _say(loaded)
+    _say("")
+    if not data.airspaces:
+        _say(
+            "WARNING: no usable airspace was loaded, so nothing was checked. Download the data "
+            "again with `take2 fetch-airspace --country RO`."
+        )
     if events:
         for line in _event_table(events):
-            typer.echo(line)
-        typer.echo("")
-    for line in _summary(events):
-        typer.echo(line)
-    typer.echo(NOT_FOR_NAVIGATION)
-    typer.echo(ATTRIBUTION)
+            _say(line)
+        _say("")
+    if data.airspaces:
+        for line in _summary(events):
+            _say(line)
+    _say(NOT_FOR_NAVIGATION)
+    _say(ATTRIBUTION)
 
 
 def _event_table(events: list[Event]) -> list[str]:
@@ -224,9 +235,10 @@ def _summary(events: list[Event]) -> list[str]:
     """The counts per kind and what they mean for the plan."""
     if not events:
         return [
-            "No events: the route keeps the Take 2 margins "
+            "No events against the airspace Take2 evaluates (classes A to D, P, R, TMZ, RMZ, D, "
+            "ATZ) in the loaded data: the route keeps the Take 2 margins "
             f"({DEFAULT_LATERAL_MARGIN_NM:g} NM laterally, {DEFAULT_VERTICAL_MARGIN_FT:g} ft "
-            "vertically) to all loaded airspace."
+            "vertically) to them. Other airspace types and areas outside the data are not checked."
         ]
     counts = Counter(event.kind for event in events)
     lines = [
@@ -243,8 +255,8 @@ def _summary(events: list[Event]) -> list[str]:
     ]
     if counts["INFRINGEMENT"]:
         lines.append(
-            "The route enters airspace that needs a clearance: change the route, or plan to "
-            "obtain the clearance."
+            "The route enters airspace that needs a clearance or permission: change the route, "
+            "or plan to obtain it before the flight; prohibited areas cannot be entered."
         )
     if counts["WARNING"]:
         lines.append(
@@ -256,6 +268,11 @@ def _summary(events: list[Event]) -> list[str]:
     if any(event.approximate for event in events):
         lines.append("~ approximate: a ground-referenced limit with terrain assumed at 0 ft.")
     return lines
+
+
+def _say(line: str) -> None:
+    """Print one line of output, made safe for a terminal."""
+    typer.echo(_printable(line))
 
 
 def _printable(text: str) -> str:
@@ -273,7 +290,7 @@ def _items(count: int) -> str:
 
 def _fail(message: str) -> NoReturn:
     """Print ``Error: message`` on stderr and exit with code 1."""
-    typer.echo(f"Error: {message}", err=True)
+    typer.echo(f"Error: {_printable(message)}", err=True)
     raise typer.Exit(code=1)
 
 
