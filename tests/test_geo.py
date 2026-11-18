@@ -430,3 +430,33 @@ def test_lateral_distance_is_accurate_200_km_from_the_projection_centre(
     distance_nm = lateral_distance_nm(projection.polygon(ring), projection.point(*point))
 
     assert distance_nm == pytest.approx(1.5, abs=TOLERANCE_NM)
+
+
+def test_samples_carry_the_index_of_their_leg() -> None:
+    # Analysis needs it to judge each piece of route at its own leg's altitude.
+    a, b, c = (26.0, 44.0), (26.0, 44.5), (26.5, 44.5)
+    samples = densify_route(make_route((*a, 2000), (*b, 2500), (*c, 3000)))
+    leg1_nm = geodesic_distance_m(*a, *b) / M_PER_NM
+
+    assert {s.leg_index for s in samples if s.dist_nm < leg1_nm} == {0}
+    assert {s.leg_index for s in samples if s.dist_nm >= leg1_nm} == {1}
+
+
+def test_projecting_many_points_matches_projecting_one_at_a_time() -> None:
+    projection = LocalProjection(center_lon=26.0, center_lat=44.5)
+    points = [(26.0, 44.5), (26.3, 44.6), (25.8, 44.2)]
+
+    xy_m = projection.to_xy_m_many([p[0] for p in points], [p[1] for p in points])
+
+    assert xy_m.shape == (3, 2)
+    for (lon, lat), row in zip(points, xy_m, strict=True):
+        assert tuple(row) == pytest.approx(projection.to_xy_m(lon, lat), abs=1e-6)
+
+
+def test_leg_index_counts_zero_length_legs() -> None:
+    a, b, c = (26.0, 44.0), (26.0, 44.5), (26.5, 44.5)
+    samples = densify_route(make_route((*a, 2000), (*b, 2500), (*b, 2600), (*c, 3000)))
+    leg1_nm = geodesic_distance_m(*a, *b) / M_PER_NM
+
+    assert {s.leg_index for s in samples if s.dist_nm < leg1_nm} == {0}
+    assert {s.leg_index for s in samples if s.dist_nm >= leg1_nm} == {2}

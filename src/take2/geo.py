@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import NamedTuple, Self
 
+import numpy as np
 from pyproj import Geod, Transformer
 from shapely import Point, Polygon
 
@@ -49,6 +50,7 @@ class RouteSample:
     lat: float
     dist_nm: float  # cumulative distance from the route start
     alt_ft: float  # planned altitude on QNH: the start altitude of the leg (flat legs)
+    leg_index: int  # index of the leg (waypoint i to i+1) the sample belongs to
 
 
 def geodesic_distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -86,10 +88,10 @@ def densify_route(route: Route, step_nm: float = DEFAULT_STEP_NM) -> list[RouteS
 
     samples: list[RouteSample] = []
     leg_start_nm = 0.0
-    for leg in legs:
+    for leg_index, leg in enumerate(legs):
         if leg.intervals:
             start, end = leg.start, leg.end
-            samples.append(RouteSample(start.lon, start.lat, leg_start_nm, leg.alt_ft))
+            samples.append(RouteSample(start.lon, start.lat, leg_start_nm, leg.alt_ft, leg_index))
             # Geod.npts rejects a count of 0, so a leg shorter than one step skips it.
             interior = (
                 _GEOD.npts(start.lon, start.lat, end.lon, end.lat, leg.intervals - 1)
@@ -97,13 +99,19 @@ def densify_route(route: Route, step_nm: float = DEFAULT_STEP_NM) -> list[RouteS
                 else []
             )
             samples.extend(
-                RouteSample(lon, lat, leg_start_nm + i * leg.length_nm / leg.intervals, leg.alt_ft)
+                RouteSample(
+                    lon,
+                    lat,
+                    leg_start_nm + i * leg.length_nm / leg.intervals,
+                    leg.alt_ft,
+                    leg_index,
+                )
                 for i, (lon, lat) in enumerate(interior, start=1)
             )
         leg_start_nm += leg.length_nm
 
     last = route.waypoints[-1]
-    samples.append(RouteSample(last.lon, last.lat, leg_start_nm, legs[-1].alt_ft))
+    samples.append(RouteSample(last.lon, last.lat, leg_start_nm, legs[-1].alt_ft, len(legs) - 1))
     return samples
 
 
@@ -163,6 +171,11 @@ class LocalProjection:
         """Project a WGS84 point to local ``(x_m, y_m)``."""
         x_m, y_m = self._to_xy.transform(lon, lat)
         return x_m, y_m
+
+    def to_xy_m_many(self, lons: Sequence[float], lats: Sequence[float]) -> np.ndarray:
+        """Project many WGS84 points at once; returns an array of shape ``(n, 2)`` in metres."""
+        xs_m, ys_m = self._to_xy.transform(list(lons), list(lats))
+        return np.column_stack([xs_m, ys_m])
 
     def point(self, lon: float, lat: float) -> Point:
         """Project a WGS84 point to a shapely ``Point`` in local metres."""
