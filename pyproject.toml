@@ -8,6 +8,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Alexandru Dobrescu" }]
 requires-python = ">=3.12"
 dependencies = [
+    "gpxpy>=1.6",
     "pydantic>=2.7",
 ]
 

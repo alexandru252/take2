@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fictional MSFS VFR flight plan for Take2 tests. -->
+<SimBase.Document Type="AceXML" version="1,0">
+    <Descr>AceXML Document</Descr>
+    <FlightPlan.FlightPlan>
+        <Title>Fictional VFR route</Title>
+        <FPType>VFR</FPType>
+        <CruisingAlt>4500.000</CruisingAlt>
+        <ATCWaypoint id="ALPHA">
+            <ATCWaypointType>User</ATCWaypointType>
+            <WorldPosition>N44° 24' 0.00",E25° 54' 0.00",+002500.00</WorldPosition>
+        </ATCWaypoint>
+        <ATCWaypoint id="BRAVO">
+            <ATCWaypointType>User</ATCWaypointType>
+            <WorldPosition>N44° 34' 21.56",E26° 5' 5.06",+004500.00</WorldPosition>
+        </ATCWaypoint>
+        <ATCWaypoint id="CHARLIE">
+            <ATCWaypointType>User</ATCWaypointType>
+            <WorldPosition>N44° 36' 0.00",E26° 6' 0.00",+003000.00</WorldPosition>
+        </ATCWaypoint>
+    </FlightPlan.FlightPlan>
+</SimBase.Document>

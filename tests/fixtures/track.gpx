@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fictional track for Take2 tests: no route, two segments, unnamed points. -->
+<gpx version="1.1" creator="take2 test fixture" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Fictional track</name>
+    <trkseg>
+      <trkpt lat="44.40" lon="25.90"><ele>500</ele></trkpt>
+      <trkpt lat="44.45" lon="25.95"><ele>600</ele></trkpt>
+    </trkseg>
+    <trkseg>
+      <trkpt lat="44.50" lon="26.00"></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

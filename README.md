@@ -11,6 +11,19 @@ you do not keep the "Take 2" safety margin (2 NM laterally, 200 ft vertically).
 
 **Status:** early development (v0.1 in progress). See [SPEC.md](SPEC.md) for the plan.
 
+## Route files
+
+Take2 reads routes from:
+
+- **GPX**: route points if the file has a route, otherwise track points. Elevations (metres)
+  are converted to feet.
+- **MSFS `.pln`**: the `ATCWaypoint` elements of the flight plan.
+- **CSV**: header `name,lat,lon,alt_ft`, decimal degrees, altitude in feet AMSL.
+  `alt_ft` may be left empty.
+
+Waypoints without an altitude get the cruise altitude you enter. A route needs at least two
+waypoints.
+
 ## Development
 
 Requirements: [uv](https://docs.astral.sh/uv/). uv installs Python 3.12 automatically.
