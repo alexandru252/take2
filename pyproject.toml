@@ -1,0 +1,43 @@
+[project]
+name = "take2"
+version = "0.1.0.dev0"
+description = "VFR airspace infringement prevention trainer (training only, not for navigation)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Take2 contributors" }]
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.100",
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# SPEC.md is the source specification; its code snippets are kept exactly as written.
+extend-exclude = ["SPEC.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+]

@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Take2: downloaded openAIP data (never committed)
+data/
