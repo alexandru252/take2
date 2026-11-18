@@ -65,17 +65,25 @@ class SeverityRules:
     requirement_types: frozenset[str]
     info_types: frozenset[str]
 
+    def category(self, airspace: Airspace) -> str | None:
+        """The severity section that applies to an airspace, strictest first, or None."""
+        if airspace.icao_class in self.clearance_classes or airspace.type in self.clearance_types:
+            return "clearance_required"
+        if airspace.type in self.requirement_types:
+            return "requirement"
+        if airspace.type in self.info_types:
+            return "info"
+        return None
+
     def kind(self, airspace: Airspace, state: State) -> str | None:
         """Event kind for an airspace in a given state, or None when it is not reported."""
-        if state is State.CLEAR:
+        category = self.category(airspace)
+        if state is State.CLEAR or category is None:
             return None
-        if airspace.icao_class in self.clearance_classes or airspace.type in self.clearance_types:
+        if category == "clearance_required":
             return "INFRINGEMENT" if state is State.INSIDE else "WARNING"
         if state is State.INSIDE:
-            if airspace.type in self.requirement_types:
-                return "REQUIREMENT"
-            if airspace.type in self.info_types:
-                return "INFO"
+            return "REQUIREMENT" if category == "requirement" else "INFO"
         return None
 
 
@@ -120,7 +128,29 @@ def load_severity_rules(path: str | Path = DEFAULT_SEVERITY_FILE) -> SeverityRul
     )
 
 
-def analyze_route(
+@dataclass(frozen=True)
+class AirspaceTrack:
+    """How one airspace relates to every route sample (only for airspaces near the route)."""
+
+    airspace: Airspace
+    category: str  # the severity section that applies: clearance_required, requirement or info
+    lower_ft: float  # lower limit on the day's QNH
+    upper_ft: float  # upper limit on the day's QNH
+    approximate: bool  # a GND-referenced limit was used without terrain data
+    lateral_nm: np.ndarray  # per sample; inf where farther than the margin
+    vertical_ft: np.ndarray  # per sample; 0 inside the vertical band
+    kinds: list[str | None]  # per sample event kind (None when nothing is reported)
+
+
+@dataclass(frozen=True)
+class RouteEvaluation:
+    """Samples of the route and the airspaces that matter for it."""
+
+    samples: list[RouteSample]
+    tracks: list[AirspaceTrack]
+
+
+def evaluate_route(
     route: Route,
     airspaces: list[Airspace],
     qnh_hpa: float,
@@ -130,11 +160,12 @@ def analyze_route(
     vertical_margin_ft: float = DEFAULT_VERTICAL_MARGIN_FT,
     step_nm: float = DEFAULT_STEP_NM,
     ground_elev_ft: float = 0.0,
-) -> list[Event]:
-    """Return the events of a route against airspaces, ordered by distance along the route.
+) -> RouteEvaluation:
+    """Evaluate every sample against every airspace that can produce an event.
 
-    Raises ``ValueError`` for an implausible QNH, negative or non-finite margins, a non-finite
-    ground elevation, or more than ``MAX_EVENTS`` events.
+    Airspaces are kept only if part of the route comes within ``lateral_margin_nm`` of them.
+    Raises ``ValueError`` for an implausible QNH, negative or non-finite margins, or a
+    non-finite ground elevation.
     """
     check_qnh_hpa(qnh_hpa)
     for name, value in (
@@ -153,15 +184,15 @@ def analyze_route(
     pieces = _route_pieces(samples, xy_m)
     tree = shapely.STRtree(pieces)
     alt_ft = np.array([s.alt_ft for s in samples])
-    dist_nm = [s.dist_nm for s in samples]
     margin_m = lateral_margin_nm * M_PER_NM
     # In AEQD the distance from the centre is the true geodesic distance, so an airspace whose
     # nearest vertex is farther than this cannot come within the margin of the route.
     reach_m = float(np.hypot(xy_m[:, 0], xy_m[:, 1]).max()) + margin_m + MAX_AIRSPACE_EXTENT_M
 
-    events: list[Event] = []
+    tracks: list[AirspaceTrack] = []
     for space in airspaces:
-        if rules.kind(space, State.INSIDE) is None:
+        category = rules.category(space)
+        if category is None:
             continue  # this airspace never produces an event
         ring_m = projection.to_xy_m_many(*zip(*space.polygon_lonlat, strict=True))
         if np.hypot(ring_m[:, 0], ring_m[:, 1]).min() > reach_m:
@@ -173,6 +204,8 @@ def analyze_route(
             continue
         d_h_nm = np.full(len(samples), np.inf)
         d_h_nm[near] = shapely.distance(polygon, pieces[near]) / M_PER_NM
+        if not (d_h_nm <= lateral_margin_nm).any():
+            continue
 
         lower_ft, lower_approx = limit_to_altitude_ft(space.lower, qnh_hpa, ground_elev_ft)
         upper_ft, upper_approx = limit_to_altitude_ft(space.upper, qnh_hpa, ground_elev_ft)
@@ -188,24 +221,67 @@ def analyze_route(
             rules.kind(space, State.INSIDE if i else State.CLOSE if c else State.CLEAR)
             for i, c in zip(inside, close, strict=True)
         ]
-        for kind, first, last in _runs(kinds):
+        tracks.append(
+            AirspaceTrack(
+                airspace=space,
+                category=category,
+                lower_ft=lower_ft,
+                upper_ft=upper_ft,
+                approximate=lower_approx or upper_approx,
+                lateral_nm=d_h_nm,
+                vertical_ft=d_v_ft,
+                kinds=kinds,
+            )
+        )
+    return RouteEvaluation(samples=samples, tracks=tracks)
+
+
+def analyze_route(
+    route: Route,
+    airspaces: list[Airspace],
+    qnh_hpa: float,
+    *,
+    rules: SeverityRules | None = None,
+    lateral_margin_nm: float = DEFAULT_LATERAL_MARGIN_NM,
+    vertical_margin_ft: float = DEFAULT_VERTICAL_MARGIN_FT,
+    step_nm: float = DEFAULT_STEP_NM,
+    ground_elev_ft: float = 0.0,
+) -> list[Event]:
+    """Return the events of a route against airspaces, ordered by distance along the route.
+
+    Raises ``ValueError`` like ``evaluate_route``, and when there are more than ``MAX_EVENTS``
+    events.
+    """
+    evaluation = evaluate_route(
+        route,
+        airspaces,
+        qnh_hpa,
+        rules=rules,
+        lateral_margin_nm=lateral_margin_nm,
+        vertical_margin_ft=vertical_margin_ft,
+        step_nm=step_nm,
+        ground_elev_ft=ground_elev_ft,
+    )
+    dist_nm = [s.dist_nm for s in evaluation.samples]
+    events: list[Event] = []
+    for track in evaluation.tracks:
+        for kind, first, last in _runs(track.kinds):
             events.append(
                 Event(
-                    airspace_id=space.id,
-                    airspace_name=space.name,
+                    airspace_id=track.airspace.id,
+                    airspace_name=track.airspace.name,
                     kind=kind,
                     start_nm=dist_nm[first],
                     end_nm=dist_nm[last],
-                    min_lateral_nm=float(d_h_nm[first : last + 1].min()),
-                    min_vertical_ft=float(d_v_ft[first : last + 1].min()),
-                    approximate=lower_approx or upper_approx,
+                    min_lateral_nm=float(track.lateral_nm[first : last + 1].min()),
+                    min_vertical_ft=float(track.vertical_ft[first : last + 1].min()),
+                    approximate=track.approximate,
                 )
             )
             if len(events) > MAX_EVENTS:
                 raise ValueError(
                     f"the analysis found more than {MAX_EVENTS:,} events; simplify the route"
                 )
-
     return sorted(events, key=lambda e: (e.start_nm, e.end_nm, e.airspace_id))
 
 
