@@ -22,7 +22,9 @@ Take2 reads routes from:
   `alt_ft` may be left empty.
 
 Waypoints without an altitude get the cruise altitude you enter. A route needs at least two
-waypoints.
+waypoints. Route files are limited to 10 MB, 50,000 waypoints and 1,000 NM.
+
+See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for what Take2 does not model yet.
 
 ## Development
 
