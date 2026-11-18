@@ -12,6 +12,7 @@ import os
 import threading
 import traceback
 import tracemalloc
+import zlib
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1030,6 +1031,81 @@ def test_a_declared_content_length_over_the_page_limit_is_rejected_before_readin
         fetch_with(respond(response))
 
     assert sent[0] == 0
+
+
+def test_fetch_asks_for_an_uncompressed_body() -> None:
+    server = FakeOpenAip([], [])
+
+    fetch_with(server)
+
+    for request in server.requests:
+        assert request.headers["accept-encoding"] == "identity"
+
+
+def gzip_bomb(decompressed_bytes: int) -> bytes:
+    """A gzip stream of ``decompressed_bytes`` spaces, built without holding them in memory."""
+    compressor = zlib.compressobj(9, zlib.DEFLATED, 31)  # wbits 31: gzip container
+    chunk = b" " * 1_000_000
+    parts = [compressor.compress(chunk) for _ in range(decompressed_bytes // len(chunk))]
+    parts.append(compressor.compress(b" " * (decompressed_bytes % len(chunk))))
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+def test_a_compressed_page_is_rejected_before_anything_is_decompressed() -> None:
+    bomb = gzip_bomb(MAX_PAGE_BYTES + 10_000_000)  # 60 MB of JSON whitespace when inflated
+    assert len(bomb) < 200_000  # what travels over the wire is small
+    # Streamed in network-sized chunks, as a real server sends it (a bytes body would make
+    # httpx.Response inflate it here, in the test, before the fetch even starts).
+    chunks = (bomb[i : i + 65_536] for i in range(0, len(bomb), 65_536))
+    response = httpx.Response(200, headers={"content-encoding": "gzip"}, content=chunks)
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(OpenAipFetchError, match="Content-Encoding 'gzip'") as excinfo:
+            fetch_with(respond(response))
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak_bytes < 5_000_000  # the 60 MB were never inflated
+    assert excinfo.value.status_code == 200
+    assert_key_not_shown(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "encoding", ["gzip", "deflate", "br", "zstd", "GZIP", "gzip, identity", "x-custom"]
+)
+def test_any_content_encoding_other_than_identity_is_rejected(encoding: str) -> None:
+    # A streamed body: httpx.Response would try to decode a bytes body right here.
+    content = iter([b'{"items": []}'])
+    response = httpx.Response(200, headers={"content-encoding": encoding}, content=content)
+
+    with pytest.raises(OpenAipFetchError, match="Content-Encoding"):
+        fetch_with(respond(response))
+
+
+def test_a_second_content_encoding_header_is_not_overlooked() -> None:
+    headers = [("content-encoding", "identity"), ("content-encoding", "gzip")]
+    response = httpx.Response(200, headers=headers, content=iter([gzip_bomb(10)]))
+
+    with pytest.raises(OpenAipFetchError, match="Content-Encoding 'identity, gzip'"):
+        fetch_with(respond(response))
+
+
+@pytest.mark.parametrize("encoding", ["identity", " Identity ", ""])
+def test_an_identity_content_encoding_is_accepted(encoding: str) -> None:
+    body = json.dumps({"items": [make_item()]}).encode()
+    response = httpx.Response(200, headers={"content-encoding": encoding}, content=body)
+
+    assert len(fetch_with(respond(response))) == 1
+
+
+def test_an_error_status_is_reported_even_with_a_compressed_body() -> None:
+    response = httpx.Response(401, headers={"content-encoding": "gzip"}, content=gzip_bomb(10))
+
+    with pytest.raises(OpenAipFetchError, match=r"rejected the API key \(HTTP 401\)"):
+        fetch_with(respond(response))
 
 
 def test_an_endless_streamed_page_is_cut_off_at_the_page_limit(

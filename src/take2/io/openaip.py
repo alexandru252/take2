@@ -42,7 +42,7 @@ API_KEY_HEADER = "x-openaip-api-key"
 PAGE_SIZE = 1000  # items requested per page (the openAIP ``limit`` parameter)
 # Bounds for a download, so a broken or hostile server cannot loop or exhaust memory.
 MAX_PAGES = 100
-MAX_PAGE_BYTES = 50_000_000  # one page, after content decoding
+MAX_PAGE_BYTES = 50_000_000  # one page body as received (compressed bodies are refused)
 MAX_DOWNLOAD_BYTES = 100_000_000  # all pages together; equal to the file limit below
 MAX_PAGE_SECONDS = 120.0  # wall-clock time for one page, however slowly it trickles in
 REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=10.0)  # seconds per connect, read, write
@@ -528,16 +528,22 @@ def _download_page(
             headers={
                 API_KEY_HEADER: api_key,
                 "Accept": "application/json",
+                # No compression: httpx inflates each received chunk before the size check
+                # could see it, so a small compressed body could take gigabytes of memory.
+                "Accept-Encoding": "identity",
                 "User-Agent": f"take2/{__version__}",
             },
             timeout=REQUEST_TIMEOUT,
             follow_redirects=False,
         ) as response:
             _check_status(response.status_code)
+            _check_not_compressed(response.headers.get("content-encoding", ""), page)
             declared = response.headers.get("content-length", "")
             if declared.isascii() and declared.isdigit() and int(declared) > limit_bytes:
                 raise _too_large(page, limit_bytes, total_left)
             body = bytearray()
+            # httpx chooses its decoder from the same Content-Encoding header checked above,
+            # so these are the bytes received, not an inflated version of them.
             for chunk in response.iter_bytes():
                 body += chunk
                 if len(body) > limit_bytes:
@@ -567,6 +573,17 @@ def _check_status(status: int) -> None:
         hint = "openAIP server error; try again later"
     message = f"openAIP request failed with HTTP {status}"
     raise OpenAipFetchError(f"{message} ({hint})" if hint else message, status)
+
+
+def _check_not_compressed(content_encoding: str, page: int) -> None:
+    """Refuse a compressed body: identity was requested, but a server or proxy may ignore it."""
+    if content_encoding.strip().lower() in ("", "identity"):
+        return
+    raise OpenAipFetchError(
+        f"openAIP sent page {page} with Content-Encoding {_preview(content_encoding, 20)!r} "
+        "although an uncompressed response was requested; refusing to decompress it",
+        status_code=200,
+    )
 
 
 def _too_large(page: int, limit_bytes: int, total_left: int) -> OpenAipFetchError:
