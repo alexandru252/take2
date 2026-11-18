@@ -56,6 +56,12 @@ def test_waypoint_accepts_coordinates_on_the_valid_range_limits(lat: float, lon:
     assert (waypoint.lat, waypoint.lon) == (lat, lon)
 
 
+def test_waypoint_name_is_limited_to_256_characters() -> None:
+    assert Waypoint(name="N" * 256, lat=44.5, lon=26.0).name == "N" * 256
+    with pytest.raises(ValidationError, match="name"):
+        Waypoint(name="N" * 257, lat=44.5, lon=26.0)
+
+
 def test_waypoint_altitude_is_optional() -> None:
     assert Waypoint(name="P", lat=44.5, lon=26.0).alt_ft is None
 
@@ -89,11 +95,14 @@ def test_route_needs_at_least_two_waypoints(count: int) -> None:
         Route(waypoints=waypoints)
 
 
-def test_route_rejects_more_than_the_maximum_number_of_waypoints() -> None:
+def test_route_accepts_up_to_50_000_waypoints() -> None:
     waypoint = Waypoint(name="P", lat=44.5, lon=26.0)
 
-    with pytest.raises(ValidationError, match="at most"):
-        Route(waypoints=[waypoint] * (MAX_ROUTE_WAYPOINTS + 1))
+    assert MAX_ROUTE_WAYPOINTS == 50_000
+    assert len(Route(waypoints=[waypoint] * 50_000).waypoints) == 50_000
+    with pytest.raises(ValidationError) as excinfo:
+        Route(waypoints=[waypoint] * 50_001)
+    assert excinfo.value.errors()[0]["type"] == "too_long"
 
 
 def test_route_with_two_waypoints_is_valid() -> None:
@@ -175,7 +184,7 @@ def test_event_rejects_unknown_kind() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("end_nm", math.nan), ("min_lateral_nm", math.inf), ("min_vertical_ft", math.nan)],
+    [("end_nm", math.nan), ("min_lateral_nm", math.inf), ("min_vertical_ft", math.inf)],
 )
 def test_event_rejects_non_finite_distances(field: str, value: float) -> None:
     with pytest.raises(ValidationError, match=field):
@@ -188,5 +197,8 @@ def test_event_rejects_non_finite_distances(field: str, value: float) -> None:
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_vertical_limit_rejects_non_finite_value(value: float) -> None:
     # NaN would make every altitude comparison False, so an infringement would read as clear.
-    with pytest.raises(ValidationError, match="value"):
+    with pytest.raises(ValidationError) as excinfo:
         VerticalLimit(value=value, unit="FL", reference=LimitReference.STD)
+
+    error = excinfo.value.errors()[0]
+    assert (error["loc"], error["type"]) == (("value",), "finite_number")

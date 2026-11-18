@@ -61,7 +61,7 @@ class Waypoint(BaseModel):
 
     model_config = ConfigDict(allow_inf_nan=False)
 
-    name: str
+    name: str = Field(max_length=256)
     lat: Latitude
     lon: Longitude
     alt_ft: float | None = None  # planned altitude AMSL on QNH
