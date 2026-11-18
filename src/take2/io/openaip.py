@@ -16,14 +16,17 @@ schema (https://api.core.openaip.net/api/schemas/response/airspace/airspace-sche
 Airspace data © openAIP contributors (openaip.net), CC BY-NC 4.0.
 """
 
+import contextlib
 import json
 import math
 import os
 import re
 import stat
+import tempfile
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -44,6 +47,8 @@ MAX_DOWNLOAD_BYTES = 100_000_000  # all pages together; equal to the file limit 
 MAX_PAGE_SECONDS = 120.0  # wall-clock time for one page, however slowly it trickles in
 REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=10.0)  # seconds per connect, read, write
 MAX_API_KEY_LENGTH = 512
+API_KEY_ENV_VAR = "OPENAIP_API_KEY"
+MAX_ENV_FILE_SIZE = 1_000_000  # bytes; a .env file is a few lines
 
 # Generous on purpose (room for large countries); it bounds what a hostile file can cost.
 MAX_OPENAIP_FILE_SIZE = 100_000_000  # bytes
@@ -52,6 +57,10 @@ MAX_TYPE_CODE = 999  # openAIP type codes are small; larger numbers are treated 
 _ERROR_PREVIEW_CHARS = 40
 _COUNTRY_RE = re.compile(r"[A-Za-z]{2}")  # used with fullmatch: no trailing newline
 _API_KEY_RE = re.compile(r"[!-~]+")  # visible ASCII: valid in a header, nothing to escape
+# One .env assignment: optional "export", a variable name, "=", the rest of the line.
+_ENV_LINE_RE = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*")
+# Starts a comment in an unquoted value: "#" at its start or after whitespace ("a#b" is a value).
+_ENV_COMMENT_RE = re.compile(r"(?:^|\s+)#")
 _clock = time.monotonic  # replaced in tests
 
 # openAIP airspace type code -> Take2 type string. P, R, D, CTR, TMZ, RMZ, TMA, ATZ and CTA
@@ -187,6 +196,94 @@ def load_openaip_file(path: str | Path) -> ParseResult:
             f"{name}: expected a list of openAIP items or an object with an 'items' list"
         )
     return parse_openaip_airspaces(items)
+
+
+def save_openaip_file(path: str | Path, items: list[dict[str, object]], *, country: str) -> None:
+    """Write raw openAIP items to a file that ``load_openaip_file`` reads back.
+
+    The file is a UTF-8 JSON object: ``attribution`` (the openAIP licence line),
+    ``country``, ``fetchedAt`` (UTC, ISO 8601) and ``items`` exactly as given. It is written
+    to a temporary file in the same directory and then renamed over ``path``, so an existing
+    file is either fully replaced or left as it was. Missing parent directories are created.
+
+    Raises ``OpenAipFileError`` if the items are not standard JSON or would make a file
+    larger than ``MAX_OPENAIP_FILE_SIZE`` (nothing is written), and ``OSError`` if writing
+    fails.
+    """
+    path = Path(path)
+    document = {
+        "attribution": ATTRIBUTION,
+        "country": normalize_country(country),
+        "fetchedAt": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "items": items,
+    }
+    try:
+        text = json.dumps(document, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise OpenAipFileError(f"the airspace items cannot be written as JSON: {exc}") from None
+    data = text.encode("utf-8") + b"\n"
+    if len(data) > MAX_OPENAIP_FILE_SIZE:
+        raise OpenAipFileError(
+            f"the airspace data is larger than {MAX_OPENAIP_FILE_SIZE:,} bytes "
+            "and could not be read back"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+        raise
+
+
+def read_api_key(env_file: Path = Path(".env")) -> str | None:
+    """The openAIP API key, or None when none is configured.
+
+    The ``OPENAIP_API_KEY`` environment variable wins when it is set and not blank.
+    Otherwise ``env_file`` is read if it is a regular file: simple ``KEY=VALUE`` lines, an
+    optional ``export`` prefix, optional single or double quotes around the value, ``#``
+    comment lines and `` # comments`` after an unquoted value. The last assignment wins; an
+    empty value means no key. There are no escapes or variable expansion.
+
+    Raises ``ValueError`` (never quoting the value) if the file is larger than
+    ``MAX_ENV_FILE_SIZE``, is not UTF-8, or the key's value has an unclosed quote, and
+    ``OSError`` if it cannot be read.
+    """
+    from_environment = os.environ.get(API_KEY_ENV_VAR, "").strip()
+    if from_environment:
+        return from_environment
+    if not env_file.is_file():  # also keeps a FIFO from blocking the read below
+        return None
+    name = _preview(env_file.name)
+    with env_file.open("rb") as file:
+        data = file.read(MAX_ENV_FILE_SIZE + 1)
+    if len(data) > MAX_ENV_FILE_SIZE:
+        raise ValueError(f"{name} is larger than {MAX_ENV_FILE_SIZE:,} bytes")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ValueError(f"{name} is not a UTF-8 text file") from None
+    value: str | None = None
+    for line in text.splitlines():
+        match = _ENV_LINE_RE.fullmatch(line)
+        if match is not None and match.group(1) == API_KEY_ENV_VAR:
+            value = _env_value(match.group(2), name)
+    return value or None
+
+
+def _env_value(raw: str, file_name: str) -> str:
+    """The value part of a ``.env`` line: unquoted, without a trailing comment."""
+    if raw[:1] in ('"', "'"):
+        end = raw.find(raw[0], 1)
+        if end == -1:
+            raise ValueError(f"{API_KEY_ENV_VAR} in {file_name} has no closing quote")
+        return raw[1:end]
+    return _ENV_COMMENT_RE.split(raw, maxsplit=1)[0].strip()
 
 
 def _parse_json(data: bytes) -> object:

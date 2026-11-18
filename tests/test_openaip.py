@@ -13,6 +13,7 @@ import threading
 import traceback
 import tracemalloc
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -23,8 +24,11 @@ from hypothesis import strategies as st
 import take2
 from take2.io import openaip
 from take2.io.openaip import (
+    API_KEY_ENV_VAR,
+    ATTRIBUTION,
     ICAO_CLASS_BY_CODE,
     MAX_DOWNLOAD_BYTES,
+    MAX_ENV_FILE_SIZE,
     MAX_OPENAIP_FILE_SIZE,
     MAX_PAGE_BYTES,
     MAX_PAGE_SECONDS,
@@ -42,6 +46,8 @@ from take2.io.openaip import (
     load_openaip_file,
     normalize_country,
     parse_openaip_airspaces,
+    read_api_key,
+    save_openaip_file,
 )
 from take2.models import Airspace, LimitReference, VerticalLimit
 
@@ -1146,3 +1152,282 @@ def test_logging_during_a_fetch_never_shows_the_key(caplog: pytest.LogCaptureFix
 
     assert caplog.records  # httpx logs each request, so the check below is not vacuous
     assert FAKE_KEY not in caplog.text
+
+
+# --- save_openaip_file ------------------------------------------------------------
+
+
+def test_a_saved_file_loads_back_into_the_same_airspaces(tmp_path: Path) -> None:
+    items = [make_item(_id="a"), make_item(_id="b", type=4), make_item(_id="c", geometry=None)]
+    path = tmp_path / "ro.json"
+
+    save_openaip_file(path, items, country="RO")
+
+    result = load_openaip_file(path)
+    assert [a.id for a in result.airspaces] == ["a", "b"]
+    assert result.skipped == 1  # the raw items are saved as they came, broken ones included
+
+
+def test_a_saved_file_carries_the_attribution_country_and_raw_items(tmp_path: Path) -> None:
+    items = [make_item(name="FICTIONAL ȘOIM CTR")]
+    path = tmp_path / "ro.json"
+
+    save_openaip_file(path, items, country="ro")
+
+    data = path.read_bytes()
+    assert "FICTIONAL ȘOIM CTR".encode() in data  # UTF-8, not \u escapes
+    document = json.loads(data)
+    assert document["attribution"] == ATTRIBUTION
+    assert document["country"] == "RO"
+    assert document["items"] == items
+    fetched_at = datetime.fromisoformat(document["fetchedAt"])
+    assert fetched_at.utcoffset() == timedelta(0)
+    assert abs(datetime.now(UTC) - fetched_at) < timedelta(minutes=5)
+
+
+def test_the_attribution_text() -> None:
+    assert ATTRIBUTION == "Airspace data © openAIP contributors (openaip.net), CC BY-NC 4.0"
+
+
+def test_save_creates_missing_parent_directories(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "nested" / "ro.json"
+
+    save_openaip_file(path, [make_item()], country="RO")
+
+    assert len(load_openaip_file(path).airspaces) == 1
+
+
+def test_save_replaces_an_existing_file_and_leaves_no_temporary_file(tmp_path: Path) -> None:
+    path = tmp_path / "ro.json"
+    path.write_text("old content", encoding="utf-8")
+
+    save_openaip_file(path, [make_item()], country="RO")
+
+    assert len(load_openaip_file(path).airspaces) == 1
+    assert [p.name for p in tmp_path.iterdir()] == ["ro.json"]
+
+
+@pytest.mark.parametrize("failing", ["fsync", "replace"])
+def test_a_failed_save_keeps_the_old_file_and_removes_the_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    path = tmp_path / "ro.json"
+    path.write_text("old content", encoding="utf-8")
+
+    def fail(*args: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(openaip.os, failing, fail)
+
+    with pytest.raises(OSError, match="No space left"):
+        save_openaip_file(path, [make_item()], country="RO")
+
+    assert path.read_text(encoding="utf-8") == "old content"
+    assert [p.name for p in tmp_path.iterdir()] == ["ro.json"]
+
+
+def test_saving_onto_a_directory_fails_and_leaves_no_temporary_file(tmp_path: Path) -> None:
+    path = tmp_path / "ro.json"
+    path.mkdir()
+
+    with pytest.raises(OSError):
+        save_openaip_file(path, [make_item()], country="RO")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["ro.json"]
+
+
+@pytest.mark.parametrize(
+    "items",
+    [[{"value": float("nan")}], [{"value": {1, 2}}]],
+    ids=["NaN", "a set"],
+)
+def test_items_that_are_not_standard_json_are_not_saved(tmp_path: Path, items: list) -> None:
+    path = tmp_path / "ro.json"
+
+    with pytest.raises(OpenAipFileError, match="cannot be written as JSON"):
+        save_openaip_file(path, items, country="RO")
+
+    assert not path.exists()
+
+
+def test_data_too_large_to_read_back_is_not_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(openaip, "MAX_OPENAIP_FILE_SIZE", 1_000)
+    path = tmp_path / "ro.json"
+
+    with pytest.raises(OpenAipFileError, match="larger than 1,000 bytes"):
+        save_openaip_file(path, [make_item(_id=f"i{n}") for n in range(10)], country="RO")
+
+    assert not path.exists()
+
+
+def test_save_rejects_an_invalid_country(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="two-letter"):
+        save_openaip_file(tmp_path / "x.json", [], country="ROU")
+
+
+# --- read_api_key -----------------------------------------------------------------
+
+
+@pytest.fixture
+def no_key_in_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+
+
+def env_file(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / ".env"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_environment_variable_wins_over_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAIP_API_KEY", "key-from-environment")
+
+    assert read_api_key(env_file(tmp_path, "OPENAIP_API_KEY=key-from-file\n")) == (
+        "key-from-environment"
+    )
+
+
+def test_surrounding_whitespace_of_the_environment_variable_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAIP_API_KEY", "  key-from-environment\n")
+
+    assert read_api_key(tmp_path / ".env") == "key-from-environment"
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_environment_variable_falls_back_to_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("OPENAIP_API_KEY", value)
+
+    assert read_api_key(env_file(tmp_path, "OPENAIP_API_KEY=key-from-file\n")) == "key-from-file"
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_no_environment_variable_and_no_env_file_gives_none(tmp_path: Path) -> None:
+    assert read_api_key(tmp_path / ".env") is None
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_the_default_env_file_is_dot_env_in_the_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file(tmp_path, "OPENAIP_API_KEY=key-from-cwd\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert read_api_key() == "key-from-cwd"
+
+
+ENV_FILES = {
+    "plain": ("OPENAIP_API_KEY=abc123\n", "abc123"),
+    "no final newline": ("OPENAIP_API_KEY=abc123", "abc123"),
+    "spaces around =": ("OPENAIP_API_KEY = abc123  \n", "abc123"),
+    "leading spaces": ("   OPENAIP_API_KEY=abc123\n", "abc123"),
+    "export prefix": ("export OPENAIP_API_KEY=abc123\n", "abc123"),
+    "export with tabs": ("export\t\tOPENAIP_API_KEY=abc123\n", "abc123"),
+    "double quotes": ('OPENAIP_API_KEY="abc123"\n', "abc123"),
+    "single quotes": ("OPENAIP_API_KEY='abc123'\n", "abc123"),
+    "quotes keep inner spaces": ('OPENAIP_API_KEY=" abc 123 "\n', " abc 123 "),
+    "comment after the value": ("OPENAIP_API_KEY=abc123 # my key\n", "abc123"),
+    "comment after quotes": ('OPENAIP_API_KEY="abc#123"   # my key\n', "abc#123"),
+    "hash inside a value": ("OPENAIP_API_KEY=abc#123\n", "abc#123"),
+    "commented-out line": ("# OPENAIP_API_KEY=old\nOPENAIP_API_KEY=new\n", "new"),
+    "other keys around": ("A=1\nOPENAIP_API_KEY=abc123\nB=2\n", "abc123"),
+    "last assignment wins": ("OPENAIP_API_KEY=first\nOPENAIP_API_KEY=second\n", "second"),
+    "CRLF line endings": ("A=1\r\nOPENAIP_API_KEY=abc123\r\n", "abc123"),
+    "blank lines": ("\n\n   \nOPENAIP_API_KEY=abc123\n\n", "abc123"),
+    "value with =": ("OPENAIP_API_KEY=abc=123==\n", "abc=123=="),
+    "only similar names": ("OPENAIP_API_KEY_OLD=x\nMY_OPENAIP_API_KEY=y\n", None),
+    "empty value": ("OPENAIP_API_KEY=\n", None),
+    "empty quotes": ('OPENAIP_API_KEY=""\n', None),
+    "only a comment": ("OPENAIP_API_KEY= # fill in\n", None),
+    "no equals sign": ("OPENAIP_API_KEY\n", None),
+    "colon instead of =": ("OPENAIP_API_KEY: abc123\n", None),
+    "empty file": ("", None),
+    "later empty assignment clears it": ("OPENAIP_API_KEY=abc\nOPENAIP_API_KEY=\n", None),
+}
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize(("text", "expected"), ENV_FILES.values(), ids=ENV_FILES.keys())
+def test_env_file_lines(tmp_path: Path, text: str, expected: str | None) -> None:
+    assert read_api_key(env_file(tmp_path, text)) == expected
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_env_file_with_a_utf8_bom(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_bytes(b"\xef\xbb\xbfOPENAIP_API_KEY=abc123\n")
+
+    assert read_api_key(path) == "abc123"
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize("text", ['OPENAIP_API_KEY="abc123\n', "OPENAIP_API_KEY='abc123\n"])
+def test_an_unclosed_quote_is_an_error_that_does_not_echo_the_value(
+    tmp_path: Path, text: str
+) -> None:
+    with pytest.raises(ValueError, match="closing quote") as excinfo:
+        read_api_key(env_file(tmp_path, text))
+
+    assert "abc123" not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_an_env_file_that_is_not_utf8_is_an_error(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_bytes(b"OPENAIP_API_KEY=abc\xff\n")
+
+    with pytest.raises(ValueError, match=r"\.env is not a UTF-8 text file") as excinfo:
+        read_api_key(path)
+
+    assert "abc" not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_an_env_file_larger_than_1_mb_is_an_error(tmp_path: Path) -> None:
+    path = env_file(tmp_path, "#" * MAX_ENV_FILE_SIZE + "\nOPENAIP_API_KEY=abc\n")
+
+    with pytest.raises(ValueError, match="larger than 1,000,000 bytes"):
+        read_api_key(path)
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+def test_a_huge_env_file_is_rejected_without_reading_all_of_it(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    with path.open("wb") as file:
+        file.truncate(200_000_000)  # sparse: no disk space used
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="larger than"):
+            read_api_key(path)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak_bytes < 5_000_000
+
+
+def test_max_env_file_size_is_1_000_000_bytes() -> None:
+    assert MAX_ENV_FILE_SIZE == 1_000_000
+
+
+@pytest.mark.usefixtures("no_key_in_environment")
+@pytest.mark.parametrize("make", ["directory", "fifo"])
+def test_an_env_path_that_is_not_a_regular_file_is_ignored(tmp_path: Path, make: str) -> None:
+    path = tmp_path / ".env"
+    path.mkdir() if make == "directory" else os.mkfifo(path)
+    outcome: list[object] = []
+
+    worker = threading.Thread(target=lambda: outcome.append(read_api_key(path)), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "read_api_key blocked"
+    assert outcome == [None]
