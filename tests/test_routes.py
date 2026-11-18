@@ -3,8 +3,10 @@
 import shutil
 from pathlib import Path
 
+import gpxpy.parser
 import pytest
 
+from take2.io import routes
 from take2.io.routes import (
     RouteImportError,
     load_route,
@@ -13,6 +15,7 @@ from take2.io.routes import (
     parse_pln,
     parse_world_position,
 )
+from take2.models import MAX_ROUTE_WAYPOINTS
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CRUISE_FT = 4500.0
@@ -188,6 +191,8 @@ def test_parse_world_position_without_altitude() -> None:
         "E44° 30' 0.00\",N26° 0' 0.00\",+000100.00",  # hemispheres swapped
         "N44° 75' 0.00\",E26° 0' 0.00\",+000100.00",  # minutes >= 60
         "N44° 30' 61.00\",E26° 0' 0.00\",+000100.00",  # seconds >= 60
+        "N44° 60' 0.00\",E26° 0' 0.00\",+000100.00",  # minutes exactly 60
+        "N44° 30' 60.00\",E26° 0' 0.00\",+000100.00",  # seconds exactly 60
         "N44° 30' 0.00\",E26° 0' 0.00\",high",  # altitude not a number
     ],
 )
@@ -256,3 +261,199 @@ def test_out_of_range_pln_latitude_is_rejected() -> None:
 
     with pytest.raises(RouteImportError, match="lat"):
         parse_pln(text, cruise_alt_ft=CRUISE_FT)
+
+
+# --- input handling found in review (QA) -------------------------------------------
+
+
+def gpx_document(body: str) -> str:
+    return f'<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">{body}</gpx>'
+
+
+def test_csv_columns_are_matched_by_header_name() -> None:
+    route = parse_csv("name,lon,lat,alt_ft\nA,26.0,44.5,\nB,26.1,44.6,\n", cruise_alt_ft=CRUISE_FT)
+
+    assert [(w.lat, w.lon) for w in route.waypoints] == [(44.5, 26.0), (44.6, 26.1)]
+
+
+@pytest.mark.parametrize(
+    ("parser", "text"),
+    [
+        pytest.param(parse_csv, "name,lat,lon,alt_ft\nA,44.5,26.0,0\nB,44.6,26.1,0\n", id="csv"),
+        pytest.param(
+            parse_gpx,
+            gpx_document(
+                '<rte><rtept lat="44.5" lon="26.0"><ele>0</ele></rtept>'
+                '<rtept lat="44.6" lon="26.1"><ele>0</ele></rtept></rte>'
+            ),
+            id="gpx",
+        ),
+        pytest.param(
+            parse_pln,
+            pln_document(
+                "N44° 30' 0.00\",E26° 0' 0.00\",+000000.00",
+                "N44° 36' 0.00\",E26° 6' 0.00\",+000000.00",
+            ),
+            id="pln",
+        ),
+    ],
+)
+def test_zero_altitude_is_kept_not_replaced_by_cruise(parser, text: str) -> None:
+    route = parser(text, cruise_alt_ft=CRUISE_FT)
+
+    assert [w.alt_ft for w in route.waypoints] == [0.0, 0.0]
+
+
+def test_gpx_with_empty_route_falls_back_to_track_points() -> None:
+    text = gpx_document(
+        '<rte></rte><trk><trkseg><trkpt lat="44.5" lon="26.0"/><trkpt lat="44.6" lon="26.1"/>'
+        "</trkseg></trk>"
+    )
+
+    assert [(w.lat, w.lon) for w in parse_gpx(text, CRUISE_FT).waypoints] == [
+        (44.5, 26.0),
+        (44.6, 26.1),
+    ]
+
+
+def test_gpx_with_several_routes_joins_their_points_in_file_order() -> None:
+    text = gpx_document(
+        '<rte><rtept lat="44.1" lon="26.0"/><rtept lat="44.2" lon="26.0"/></rte>'
+        '<rte><rtept lat="44.3" lon="26.0"/><rtept lat="44.4" lon="26.0"/></rte>'
+    )
+
+    assert [w.lat for w in parse_gpx(text, CRUISE_FT).waypoints] == [44.1, 44.2, 44.3, 44.4]
+
+
+def test_load_route_rejects_a_non_utf8_file(tmp_path: Path) -> None:
+    path = tmp_path / "latin1.csv"
+    path.write_bytes(b"name,lat,lon,alt_ft\nA\xb0,44.5,26.0,\nB,44.6,26.1,\n")
+
+    with pytest.raises(RouteImportError, match="latin1.csv"):
+        load_route(path, cruise_alt_ft=CRUISE_FT)
+
+
+# --- hostile input (security review) -----------------------------------------------
+
+BILLION_LAUGHS_DTD = (
+    '<?xml version="1.0"?><!DOCTYPE d [<!ENTITY a "aaaaaaaaaa">'
+    + "".join(f'<!ENTITY {chr(98 + i)} "{("&" + chr(97 + i) + ";") * 10}">' for i in range(9))
+    + "]>"
+)
+XXE_DTD = '<?xml version="1.0"?><!DOCTYPE d [<!ENTITY j SYSTEM "file:///etc/passwd">]>'
+
+
+@pytest.mark.parametrize("dtd", [BILLION_LAUGHS_DTD, XXE_DTD], ids=["billion-laughs", "xxe"])
+def test_gpx_rejects_entity_attacks(dtd: str) -> None:
+    body = (
+        '<rte><rtept lat="44.5" lon="26.0"><name>&j;</name></rtept>'
+        '<rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    with pytest.raises(RouteImportError):
+        parse_gpx(dtd + gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize("dtd", [BILLION_LAUGHS_DTD, XXE_DTD], ids=["billion-laughs", "xxe"])
+def test_pln_rejects_entity_attacks(dtd: str) -> None:
+    text = pln_document("N44° 30' 0.00\",E26° 0' 0.00\"", "N44° 36' 0.00\",E26° 6' 0.00\"")
+    text = text.replace('<?xml version="1.0" encoding="UTF-8"?>', dtd).replace(
+        'id="P1"', 'id="&j;"'
+    )
+
+    with pytest.raises(RouteImportError):
+        parse_pln(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_gpx_is_parsed_with_the_stdlib_xml_parser() -> None:
+    # The entity-attack protection above relies on the stdlib parser (expat). gpxpy switches
+    # to lxml silently if lxml is importable, which would need its own review.
+    assert gpxpy.parser.library() == "STDLIB"
+
+
+def test_deeply_nested_gpx_is_rejected() -> None:
+    # gpxpy deep-copies nested <extensions> recursively: ~100,000 levels crash the process.
+    nested = "<x>" * 1_000 + "</x>" * 1_000
+    body = (
+        f'<rte><rtept lat="44.5" lon="26.0"><extensions>{nested}</extensions></rtept>'
+        '<rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    with pytest.raises(RouteImportError, match="nested"):
+        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+def test_deeply_nested_pln_is_rejected() -> None:
+    nested = "<x>" * 1_000 + "</x>" * 1_000
+    text = pln_document("N44° 30' 0.00\",E26° 0' 0.00\"", "N44° 36' 0.00\",E26° 6' 0.00\"")
+    text = text.replace("</FlightPlan.FlightPlan>", nested + "</FlightPlan.FlightPlan>")
+
+    with pytest.raises(RouteImportError, match="nested"):
+        parse_pln(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_gpx_with_many_namespace_declarations_is_rejected() -> None:
+    # gpxpy scans namespace declarations with a regex that is quadratic in their number.
+    declarations = " ".join(f'xmlns:n{i}="urn:take2:{i}"' for i in range(100))
+    body = (
+        f'<rte><rtept lat="44.5" lon="26.0"><extensions><e {declarations}/></extensions></rtept>'
+        '<rtept lat="44.6" lon="26.1"/></rte>'
+    )
+
+    with pytest.raises(RouteImportError, match="namespace"):
+        parse_gpx(gpx_document(body), cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize(
+    ("parser", "filename"),
+    [(parse_csv, "route.csv"), (parse_gpx, "route.gpx"), (parse_pln, "route.pln")],
+)
+def test_text_larger_than_the_limit_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, parser, filename: str
+) -> None:
+    monkeypatch.setattr(routes, "MAX_ROUTE_FILE_SIZE", 50)
+    text = (FIXTURES / filename).read_text(encoding="utf-8")
+
+    with pytest.raises(RouteImportError, match="too large"):
+        parser(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_load_route_rejects_a_file_larger_than_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(routes, "MAX_ROUTE_FILE_SIZE", 50)
+
+    with pytest.raises(RouteImportError, match="too large"):
+        load_route(FIXTURES / "route.csv", cruise_alt_ft=CRUISE_FT)
+
+
+@pytest.mark.parametrize("make", ["missing", "directory"])
+def test_load_route_rejects_a_path_that_is_not_a_file(tmp_path: Path, make: str) -> None:
+    path = tmp_path / "route.csv"
+    if make == "directory":
+        path.mkdir()
+
+    with pytest.raises(RouteImportError, match="not found"):
+        load_route(path, cruise_alt_ft=CRUISE_FT)
+
+
+def test_route_with_too_many_waypoints_is_rejected() -> None:
+    rows = "".join(f"P{i},44.5,26.0,\n" for i in range(MAX_ROUTE_WAYPOINTS + 1))
+
+    with pytest.raises(RouteImportError, match="too many waypoints"):
+        parse_csv("name,lat,lon,alt_ft\n" + rows, cruise_alt_ft=CRUISE_FT)
+
+
+def test_csv_parser_errors_become_route_import_errors() -> None:
+    # An unclosed quote over the csv module's 128 KiB field limit raises _csv.Error.
+    text = 'name,lat,lon,alt_ft\n"' + "a" * 200_000 + "\n"
+
+    with pytest.raises(RouteImportError, match="CSV"):
+        parse_csv(text, cruise_alt_ft=CRUISE_FT)
+
+
+def test_error_messages_do_not_echo_huge_input() -> None:
+    text = "name,lat,lon,alt_ft\nA," + "9" * 10_000 + "x,26.0,\nB,44.6,26.1,\n"
+
+    with pytest.raises(RouteImportError) as excinfo:
+        parse_csv(text, cruise_alt_ft=CRUISE_FT)
+
+    assert len(str(excinfo.value)) < 200
