@@ -18,11 +18,15 @@ import numpy as np
 from take2.analysis import (
     DEFAULT_LATERAL_MARGIN_NM,
     DEFAULT_VERTICAL_MARGIN_FT,
+    MAX_EVENTS,
     SeverityRules,
     evaluate_route,
 )
 from take2.geo import DEFAULT_STEP_NM, RouteSample
 from take2.models import Airspace, Route
+
+# Upper bound on the bands drawn, like the event limit of the analysis.
+MAX_SEGMENTS = MAX_EVENTS
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,11 @@ def build_profile(
     step_nm: float = DEFAULT_STEP_NM,
     ground_elev_ft: float = 0.0,
 ) -> Profile:
-    """Build the vertical profile of a route. Raises ``ValueError`` like ``analyze_route``."""
+    """Build the vertical profile of a route.
+
+    Raises ``ValueError`` like ``analyze_route``, and when there would be more than
+    ``MAX_SEGMENTS`` segments.
+    """
     evaluation = evaluate_route(
         route,
         airspaces,
@@ -70,22 +78,28 @@ def build_profile(
         step_nm=step_nm,
         ground_elev_ft=ground_elev_ft,
     )
-    dist_nm = [s.dist_nm for s in evaluation.samples]
-    segments = [
-        ProfileSegment(
-            airspace_id=track.airspace.id,
-            airspace_name=track.airspace.name,
-            start_nm=dist_nm[first],
-            end_nm=dist_nm[last],
-            lower_ft=track.lower_ft,
-            upper_ft=track.upper_ft,
-            margin_bottom_ft=track.lower_ft - vertical_margin_ft,
-            kind=track.category,
-            approximate=track.approximate,
-        )
-        for track in evaluation.tracks
-        for first, last in _true_runs(track.lateral_nm <= lateral_margin_nm)
-    ]
+    dist_nm = np.array([s.dist_nm for s in evaluation.samples])
+    segments: list[ProfileSegment] = []
+    for track in evaluation.tracks:
+        for first, last in _consecutive_runs(track.indices):
+            segments.append(
+                ProfileSegment(
+                    airspace_id=track.airspace.id,
+                    airspace_name=track.airspace.name,
+                    start_nm=float(dist_nm[track.indices[first]]),
+                    end_nm=float(dist_nm[track.indices[last]]),
+                    lower_ft=track.lower_ft,
+                    upper_ft=track.upper_ft,
+                    margin_bottom_ft=track.lower_ft - vertical_margin_ft,
+                    kind=track.category,
+                    approximate=track.approximate,
+                )
+            )
+            if len(segments) > MAX_SEGMENTS:
+                raise ValueError(
+                    f"the profile has more than {MAX_SEGMENTS:,} airspace segments; "
+                    "simplify the route"
+                )
     segments.sort(key=lambda s: (s.start_nm, s.end_nm, s.airspace_id))
     return Profile(aircraft=_aircraft_line(evaluation.samples), segments=segments)
 
@@ -103,16 +117,11 @@ def _aircraft_line(samples: list[RouteSample]) -> list[tuple[float, float]]:
     return line
 
 
-def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    """``(first, last)`` index pairs of each run of True values."""
-    runs: list[tuple[int, int]] = []
-    first: int | None = None
-    for i, value in enumerate(mask):
-        if value and first is None:
-            first = i
-        elif not value and first is not None:
-            runs.append((first, i - 1))
-            first = None
-    if first is not None:
-        runs.append((first, len(mask) - 1))
-    return runs
+def _consecutive_runs(indices: np.ndarray) -> list[tuple[int, int]]:
+    """``(first, last)`` positions of each run of consecutive sample indices."""
+    if indices.size == 0:
+        return []
+    breaks = np.flatnonzero(np.diff(indices) != 1) + 1
+    starts = np.concatenate(([0], breaks))
+    ends = np.concatenate((breaks - 1, [indices.size - 1]))
+    return [(int(a), int(b)) for a, b in zip(starts, ends, strict=True)]

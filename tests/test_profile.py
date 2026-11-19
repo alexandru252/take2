@@ -156,3 +156,13 @@ def test_entering_twice_gives_two_segments_in_route_order() -> None:
 def test_invalid_parameters_are_rejected() -> None:
     with pytest.raises(ValueError, match="QNH"):
         build_profile(route_through_centre(3000), [airspace()], qnh_hpa=29.92)
+
+
+def test_segment_count_is_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    from take2 import profile
+
+    monkeypatch.setattr(profile, "MAX_SEGMENTS", 1)
+    second = airspace(id="FIC-TMA-2")
+
+    with pytest.raises(ValueError, match="segments"):
+        build_profile(route_through_centre(6000), [airspace(), second], qnh_hpa=1013.25)

@@ -163,4 +163,6 @@ required (a test checks this).
 | Positions per airspace polygon | 20,000 |
 | Airspace name | 256 characters |
 | Events per analysis | 10,000 |
+| Route samples evaluated near airspaces (all airspaces together) | 2,000,000 |
+| Airspace segments in a profile | 10,000 |
 | Severity file | 100 KB, no YAML anchors or aliases, no duplicate keys |

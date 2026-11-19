@@ -21,7 +21,7 @@ route pieces within the margin, and the number of events is capped.
 import functools
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -39,6 +39,8 @@ DEFAULT_LATERAL_MARGIN_NM = 2.0  # Take 2 rule
 DEFAULT_VERTICAL_MARGIN_FT = 200.0  # Take 2 rule
 DEFAULT_SEVERITY_FILE = Path(__file__).resolve().parents[2] / "config" / "severity.yaml"
 MAX_EVENTS = 10_000
+# Total route samples kept across all airspaces near the route (memory bound).
+MAX_TRACK_SAMPLES = 2_000_000
 # Airspaces wider than this are not supported: the far-field check below relies on it.
 MAX_AIRSPACE_EXTENT_M = 1_500_000.0
 
@@ -128,18 +130,28 @@ def load_severity_rules(path: str | Path = DEFAULT_SEVERITY_FILE) -> SeverityRul
     )
 
 
+# Event kinds as small integer codes, so per-sample results stay compact numpy arrays.
+KIND_NAMES: tuple[str | None, ...] = (None, "INFRINGEMENT", "WARNING", "REQUIREMENT", "INFO")
+_INFRINGEMENT, _WARNING, _REQUIREMENT, _INFO = 1, 2, 3, 4
+
+
 @dataclass(frozen=True)
 class AirspaceTrack:
-    """How one airspace relates to every route sample (only for airspaces near the route)."""
+    """How one airspace relates to the route samples that come within the lateral margin.
+
+    Only those samples are kept (``indices`` into the route samples, in increasing order),
+    so memory grows with the part of the route near the airspace, not with the whole route.
+    """
 
     airspace: Airspace
     category: str  # the severity section that applies: clearance_required, requirement or info
     lower_ft: float  # lower limit on the day's QNH
     upper_ft: float  # upper limit on the day's QNH
     approximate: bool  # a GND-referenced limit was used without terrain data
-    lateral_nm: np.ndarray  # per sample; inf where farther than the margin
-    vertical_ft: np.ndarray  # per sample; 0 inside the vertical band
-    kinds: list[str | None]  # per sample event kind (None when nothing is reported)
+    indices: np.ndarray  # sample indices within the lateral margin
+    lateral_nm: np.ndarray  # lateral distance at those samples (0 inside)
+    vertical_ft: np.ndarray  # vertical distance at those samples (0 inside the band)
+    kind_codes: np.ndarray  # event kind code at those samples (index into KIND_NAMES)
 
 
 @dataclass(frozen=True)
@@ -152,7 +164,7 @@ class RouteEvaluation:
 
 def evaluate_route(
     route: Route,
-    airspaces: list[Airspace],
+    airspaces: Iterable[Airspace],
     qnh_hpa: float,
     *,
     rules: SeverityRules | None = None,
@@ -164,8 +176,86 @@ def evaluate_route(
     """Evaluate every sample against every airspace that can produce an event.
 
     Airspaces are kept only if part of the route comes within ``lateral_margin_nm`` of them.
-    Raises ``ValueError`` for an implausible QNH, negative or non-finite margins, or a
-    non-finite ground elevation.
+    Raises ``ValueError`` for an implausible QNH, negative or non-finite margins, a
+    non-finite ground elevation, or more than ``MAX_TRACK_SAMPLES`` kept samples in total.
+    """
+    samples, tracks = _evaluate(
+        route,
+        airspaces,
+        qnh_hpa,
+        rules,
+        lateral_margin_nm,
+        vertical_margin_ft,
+        step_nm,
+        ground_elev_ft,
+    )
+    return RouteEvaluation(samples=samples, tracks=list(tracks))
+
+
+def analyze_route(
+    route: Route,
+    airspaces: Iterable[Airspace],
+    qnh_hpa: float,
+    *,
+    rules: SeverityRules | None = None,
+    lateral_margin_nm: float = DEFAULT_LATERAL_MARGIN_NM,
+    vertical_margin_ft: float = DEFAULT_VERTICAL_MARGIN_FT,
+    step_nm: float = DEFAULT_STEP_NM,
+    ground_elev_ft: float = 0.0,
+) -> list[Event]:
+    """Return the events of a route against airspaces, ordered by distance along the route.
+
+    Raises ``ValueError`` like ``evaluate_route``, and as soon as there are more than
+    ``MAX_EVENTS`` events (the remaining airspaces are then not evaluated).
+    """
+    samples, tracks = _evaluate(
+        route,
+        airspaces,
+        qnh_hpa,
+        rules,
+        lateral_margin_nm,
+        vertical_margin_ft,
+        step_nm,
+        ground_elev_ft,
+    )
+    dist_nm = np.array([s.dist_nm for s in samples])
+    events: list[Event] = []
+    for track in tracks:
+        for code, first, last in _runs(track.indices, track.kind_codes):
+            if code == 0:
+                continue
+            events.append(
+                Event(
+                    airspace_id=track.airspace.id,
+                    airspace_name=track.airspace.name,
+                    kind=KIND_NAMES[code],
+                    start_nm=float(dist_nm[track.indices[first]]),
+                    end_nm=float(dist_nm[track.indices[last]]),
+                    min_lateral_nm=float(track.lateral_nm[first : last + 1].min()),
+                    min_vertical_ft=float(track.vertical_ft[first : last + 1].min()),
+                    approximate=track.approximate,
+                )
+            )
+            if len(events) > MAX_EVENTS:
+                raise ValueError(
+                    f"the analysis found more than {MAX_EVENTS:,} events; simplify the route"
+                )
+    return sorted(events, key=lambda e: (e.start_nm, e.end_nm, e.airspace_id))
+
+
+def _evaluate(
+    route: Route,
+    airspaces: Iterable[Airspace],
+    qnh_hpa: float,
+    rules: SeverityRules | None,
+    lateral_margin_nm: float,
+    vertical_margin_ft: float,
+    step_nm: float,
+    ground_elev_ft: float,
+) -> tuple[list[RouteSample], Iterator[AirspaceTrack]]:
+    """Check the parameters, sample the route, and return the samples with a lazy track stream.
+
+    The tracks are produced one airspace at a time, so a caller can stop early.
     """
     check_qnh_hpa(qnh_hpa)
     for name, value in (
@@ -189,100 +279,62 @@ def evaluate_route(
     # nearest vertex is farther than this cannot come within the margin of the route.
     reach_m = float(np.hypot(xy_m[:, 0], xy_m[:, 1]).max()) + margin_m + MAX_AIRSPACE_EXTENT_M
 
-    tracks: list[AirspaceTrack] = []
-    for space in airspaces:
-        category = rules.category(space)
-        if category is None:
-            continue  # this airspace never produces an event
-        ring_m = projection.to_xy_m_many(*zip(*space.polygon_lonlat, strict=True))
-        if np.hypot(ring_m[:, 0], ring_m[:, 1]).min() > reach_m:
-            continue  # far away, possibly where the local projection is badly distorted
-        polygon = shapely.Polygon(ring_m)
-        # Candidates within the margin (slightly widened for rounding; the exact test is below).
-        near = tree.query(polygon, predicate="dwithin", distance=margin_m * (1 + 1e-9) + 1e-6)
-        if near.size == 0:
-            continue
-        d_h_nm = np.full(len(samples), np.inf)
-        d_h_nm[near] = shapely.distance(polygon, pieces[near]) / M_PER_NM
-        if not (d_h_nm <= lateral_margin_nm).any():
-            continue
+    def tracks() -> Iterator[AirspaceTrack]:
+        kept_samples = 0
+        for space in airspaces:
+            category = rules.category(space)
+            if category is None:
+                continue  # this airspace never produces an event
+            ring_m = projection.to_xy_m_many(*zip(*space.polygon_lonlat, strict=True))
+            if np.hypot(ring_m[:, 0], ring_m[:, 1]).min() > reach_m:
+                continue  # far away, possibly where the local projection is badly distorted
+            polygon = shapely.Polygon(ring_m)
+            # Candidates within the margin (widened slightly for rounding; exact test below).
+            near = tree.query(polygon, predicate="dwithin", distance=margin_m * (1 + 1e-9) + 1e-6)
+            if near.size == 0:
+                continue
+            near = np.sort(near)
+            d_h_nm = shapely.distance(polygon, pieces[near]) / M_PER_NM
+            within = d_h_nm <= lateral_margin_nm
+            if not within.any():
+                continue
+            indices, d_h_nm = near[within], d_h_nm[within]
+            kept_samples += indices.size
+            if kept_samples > MAX_TRACK_SAMPLES:
+                raise ValueError(
+                    f"the route passes near too many airspaces: more than "
+                    f"{MAX_TRACK_SAMPLES:,} samples to evaluate; simplify the route"
+                )
 
-        lower_ft, lower_approx = limit_to_altitude_ft(space.lower, qnh_hpa, ground_elev_ft)
-        upper_ft, upper_approx = limit_to_altitude_ft(space.upper, qnh_hpa, ground_elev_ft)
-        d_v_ft = np.maximum(0.0, np.maximum(lower_ft - alt_ft, alt_ft - upper_ft))
-        inside = (d_h_nm == 0.0) & (d_v_ft == 0.0)
-        close = (
-            ~inside
-            & (d_h_nm <= lateral_margin_nm)
-            & (alt_ft >= lower_ft - vertical_margin_ft)
-            & (alt_ft <= upper_ft + vertical_margin_ft)
-        )
-        kinds = [
-            rules.kind(space, State.INSIDE if i else State.CLOSE if c else State.CLEAR)
-            for i, c in zip(inside, close, strict=True)
-        ]
-        tracks.append(
-            AirspaceTrack(
+            lower_ft, lower_approx = limit_to_altitude_ft(space.lower, qnh_hpa, ground_elev_ft)
+            upper_ft, upper_approx = limit_to_altitude_ft(space.upper, qnh_hpa, ground_elev_ft)
+            alt_near_ft = alt_ft[indices]
+            d_v_ft = np.maximum(0.0, np.maximum(lower_ft - alt_near_ft, alt_near_ft - upper_ft))
+            inside = (d_h_nm == 0.0) & (d_v_ft == 0.0)
+            close = (
+                ~inside
+                & (alt_near_ft >= lower_ft - vertical_margin_ft)
+                & (alt_near_ft <= upper_ft + vertical_margin_ft)
+            )
+            codes = np.zeros(indices.size, dtype=np.int8)
+            if category == "clearance_required":
+                codes[inside] = _INFRINGEMENT
+                codes[close] = _WARNING
+            else:
+                codes[inside] = _REQUIREMENT if category == "requirement" else _INFO
+            yield AirspaceTrack(
                 airspace=space,
                 category=category,
                 lower_ft=lower_ft,
                 upper_ft=upper_ft,
                 approximate=lower_approx or upper_approx,
+                indices=indices,
                 lateral_nm=d_h_nm,
                 vertical_ft=d_v_ft,
-                kinds=kinds,
+                kind_codes=codes,
             )
-        )
-    return RouteEvaluation(samples=samples, tracks=tracks)
 
-
-def analyze_route(
-    route: Route,
-    airspaces: list[Airspace],
-    qnh_hpa: float,
-    *,
-    rules: SeverityRules | None = None,
-    lateral_margin_nm: float = DEFAULT_LATERAL_MARGIN_NM,
-    vertical_margin_ft: float = DEFAULT_VERTICAL_MARGIN_FT,
-    step_nm: float = DEFAULT_STEP_NM,
-    ground_elev_ft: float = 0.0,
-) -> list[Event]:
-    """Return the events of a route against airspaces, ordered by distance along the route.
-
-    Raises ``ValueError`` like ``evaluate_route``, and when there are more than ``MAX_EVENTS``
-    events.
-    """
-    evaluation = evaluate_route(
-        route,
-        airspaces,
-        qnh_hpa,
-        rules=rules,
-        lateral_margin_nm=lateral_margin_nm,
-        vertical_margin_ft=vertical_margin_ft,
-        step_nm=step_nm,
-        ground_elev_ft=ground_elev_ft,
-    )
-    dist_nm = [s.dist_nm for s in evaluation.samples]
-    events: list[Event] = []
-    for track in evaluation.tracks:
-        for kind, first, last in _runs(track.kinds):
-            events.append(
-                Event(
-                    airspace_id=track.airspace.id,
-                    airspace_name=track.airspace.name,
-                    kind=kind,
-                    start_nm=dist_nm[first],
-                    end_nm=dist_nm[last],
-                    min_lateral_nm=float(track.lateral_nm[first : last + 1].min()),
-                    min_vertical_ft=float(track.vertical_ft[first : last + 1].min()),
-                    approximate=track.approximate,
-                )
-            )
-            if len(events) > MAX_EVENTS:
-                raise ValueError(
-                    f"the analysis found more than {MAX_EVENTS:,} events; simplify the route"
-                )
-    return sorted(events, key=lambda e: (e.start_nm, e.end_nm, e.airspace_id))
+    return samples, tracks()
 
 
 @functools.cache
@@ -348,11 +400,16 @@ def _route_pieces(samples: list[RouteSample], xy_m: np.ndarray) -> np.ndarray:
     return shapely.linestrings(np.stack([starts, xy_m, ends], axis=1))
 
 
-def _runs(kinds: list[str | None]) -> Iterator[tuple[str, int, int]]:
-    """``(kind, first, last)`` for each run of equal, non-None kinds."""
-    first = 0
-    for i in range(1, len(kinds) + 1):
-        if i == len(kinds) or kinds[i] != kinds[first]:
-            if kinds[first] is not None:
-                yield kinds[first], first, i - 1
-            first = i
+def _runs(indices: np.ndarray, codes: np.ndarray) -> Iterator[tuple[int, int, int]]:
+    """``(code, first, last)`` positions of each run of consecutive samples with one code.
+
+    A run breaks where the sample indices are not consecutive (the route left the margin in
+    between) or where the code changes.
+    """
+    if indices.size == 0:
+        return
+    breaks = np.flatnonzero((np.diff(indices) != 1) | (np.diff(codes) != 0)) + 1
+    starts = np.concatenate(([0], breaks))
+    ends = np.concatenate((breaks - 1, [indices.size - 1]))
+    for first, last in zip(starts, ends, strict=True):
+        yield int(codes[first]), int(first), int(last)

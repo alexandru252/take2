@@ -896,3 +896,62 @@ def test_severity_file_that_is_a_fifo_does_not_block(tmp_path: Path) -> None:
 
     assert not worker.is_alive(), "load_severity_rules blocked"
     assert isinstance(outcome[0], ValueError)
+
+
+# --- security review of milestone 7: bounded memory and early stop ------------------
+
+
+def test_memory_stays_small_for_a_long_route_near_many_airspaces() -> None:
+    # 20,000 samples and 200 small CTRs along the route: keeping per-airspace arrays for
+    # every sample used to cost ~28 bytes x samples x airspaces (1.5 GB measured end to end).
+    import tracemalloc
+
+    points = [(26.0, 40.0)]
+    for _ in range(19_999):
+        points.append(offset(*points[-1], 0, 0.03 * M_PER_NM))
+    long_route = route(*points, alt_ft=2500)
+    ctrs = [
+        airspace(
+            id=f"C{i}",
+            type="CTR",
+            lower=ft_gnd(0),
+            upper=ft_msl(3500),
+            polygon_lonlat=square_ring(*offset(*points[i * 100], 90, 1_000), 300),
+        )
+        for i in range(200)
+    ]
+
+    tracemalloc.start()
+    try:
+        events = analyze_route(long_route, ctrs, qnh_hpa=1013.25)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len({e.airspace_id for e in events}) == 200
+    assert peak < 40_000_000
+
+
+def test_event_limit_stops_before_evaluating_every_airspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(analysis, "MAX_EVENTS", 5)
+    consumed = 0
+
+    def ctrs():  # each one gives warning, infringement, warning
+        nonlocal consumed
+        for i in range(50):
+            consumed += 1
+            yield airspace(id=f"C{i}", type="CTR", lower=ft_gnd(0), upper=ft_msl(3500))
+
+    with pytest.raises(ValueError, match="events"):
+        analyze_route(route_through_centre(2500), ctrs(), qnh_hpa=1013.25)
+
+    assert consumed <= 3
+
+
+def test_total_samples_kept_for_airspaces_are_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(analysis, "MAX_TRACK_SAMPLES", 10)
+
+    with pytest.raises(ValueError, match="samples"):
+        analyze_route(route_through_centre(2500), [airspace(**CTR)], qnh_hpa=1013.25)
