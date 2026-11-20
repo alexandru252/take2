@@ -58,4 +58,5 @@ and from the web app (question, answer, explanation).
 - More scenarios based on the causal factors in UK CAA CAP3277.
 - Romanian and English interface.
 
-Each item has a GitHub issue.
+Each milestone and each item above has a
+[GitHub issue](https://github.com/alexandru252/take2/issues).
