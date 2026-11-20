@@ -71,6 +71,52 @@ Flight-level limits are converted with the QNH you give, so a low QNH brings a f
 base down. A `~` after a vertical distance means a ground-referenced limit was used with the
 terrain assumed at 0 ft.
 
+## Example
+
+The test fixtures hold a fictional route and fictional airspace, so you can try `take2 check`
+without an openAIP key. The route is
+[tests/fixtures/route.csv](tests/fixtures/route.csv):
+
+```csv
+name,lat,lon,alt_ft
+ALPHA,44.40,25.90,2500
+BRAVO,44.50,26.00,
+CHARLIE,44.60,26.10,3000
+```
+
+```sh
+uv run take2 check tests/fixtures/route.csv --qnh 998 --cruise 3000 \
+    --airspace tests/fixtures/openaip_airspaces.json
+```
+
+Output:
+
+```text
+Take2 check: route.csv, QNH 998.00 hPa, cruise 3000 ft
+Airspace: openaip_airspaces.json, 4 airspaces loaded; 1 airspace item could not be used and was skipped
+
+#  Kind          Airspace             From NM  To NM  Lateral NM  Vertical ft
+1  WARNING       FICTIONAL ALPHA CTR      3.9    6.9        0.22            0
+2  INFRINGEMENT  FICTIONAL ALPHA CTR      7.1   14.8        0.00            0
+
+Summary: 1 infringement, 1 warning, 0 requirements, 0 info.
+The route enters airspace that needs a clearance or permission: change the route, or plan to obtain it before the flight; prohibited areas cannot be entered.
+Warnings: the route does not keep the Take 2 margins (2 NM, 200 ft).
+Training tool only. Not for navigation: use official AIP data and approved tools for real flights.
+Airspace data © openAIP contributors (openaip.net), CC BY-NC 4.0
+```
+
+BRAVO has no altitude, so it gets the 3000 ft cruise altitude. From 3.9 NM the route is within
+2 NM of the class D CTR, and from 7.1 NM to the end it is inside it. "Lateral NM" and
+"Vertical ft" are the smallest distances to the airspace along each stretch; 0 means inside.
+The skipped item is a fictional airspace with a point geometry, which Take2 cannot use.
+
+## Roadmap
+
+Next are the web app, three training scenarios, and the docs for v0.1. Ideas for after v0.1
+include terrain, climb and descent planning, and more countries. See
+[ROADMAP.md](ROADMAP.md).
+
 ## Development
 
 Requirements: [uv](https://docs.astral.sh/uv/). uv installs Python 3.12 automatically.
